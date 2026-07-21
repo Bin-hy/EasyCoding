@@ -1,2 +1,129 @@
 # MewCode 配置（含真实 API 密钥）
 mewcode/.mewcode/config.yaml
+
+# ============ macOS 系统文件 ============
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ============ 常见开发工具/IDE ============
+# VSCode
+.vscode/
+*.code-workspace
+
+# IntelliJ IDEA / WebStorm / PyCharm 等
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+target/
+
+# Sublime Text
+*.sublime-workspace
+*.sublime-project
+
+# Vim / Neovim
+*.swp
+*.swo
+*~
+
+# ============ 操作系统临时文件 ============
+*.tmp
+*.temp
+*.log
+*.cache
+*.bak
+*.backup
+
+# ============ 依赖和构建目录 ============
+node_modules/
+bower_components/
+vendor/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ============ 编译产物 ============
+*.class
+*.jar
+*.war
+*.ear
+*.dll
+*.so
+*.dylib
+*.exe
+*.out
+*.app
+*.o
+*.a
+
+# ============ 包管理器锁文件（选择性忽略） ============
+# 如果你想锁定依赖版本，可以把下面注释掉
+# package-lock.json
+# yarn.lock
+# Gemfile.lock
+# poetry.lock
+
+# ============ 环境变量和敏感信息 ============
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.crt
+*.p12
+secrets/
+credentials/
+*.secret
+
+# ============ 测试和覆盖率 ============
+coverage/
+.nyc_output/
+*.test.js
+*.spec.js
+jest.config.js
+.pytest_cache/
+.tox/
+htmlcov/
+
+# ============ 临时下载和缓存 ============
+*.download
+*.part
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+
+# ============ Docker ============
+docker-compose.override.yml
+*.dockerignore
+Dockerfile.dev
+
+# ============ 数据库文件 ============
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.bak
+
+# ============ 日志文件 ============
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
