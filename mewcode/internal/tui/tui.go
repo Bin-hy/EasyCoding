@@ -6,15 +6,17 @@ import (
 	"strings"
 	"time"
 
-	tea "charm.land/bubbletea/v2"
 	"charm.land/bubbles/v2/list"
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textarea"
+	tea "charm.land/bubbletea/v2"
 	"charm.land/glamour/v2"
+	"mewcode/internal/agent"
 	"mewcode/internal/config"
 	"mewcode/internal/conversation"
 	"mewcode/internal/llm"
 	"mewcode/internal/prompt"
+	"mewcode/internal/tool"
 )
 
 // sessionState 会话状态
@@ -31,6 +33,12 @@ const (
 //go:embed style.json
 var styleJSON []byte
 
+// toolDisplay 当前执行中工具的显示信息
+type toolDisplay struct {
+	name string
+	args string
+}
+
 // Model 是 bubbletea 顶层模型
 type Model struct {
 	state    sessionState
@@ -41,13 +49,15 @@ type Model struct {
 
 	providers []config.ProviderConfig
 	provider  llm.Provider
+	registry  *tool.Registry
 	conv      *conversation.Conversation
 
 	// 流式状态
 	ctx       context.Context
 	cancel    context.CancelFunc
-	events    <-chan llm.StreamEvent
+	events    <-chan agent.Event
 	curReply  strings.Builder
+	curTool   *toolDisplay
 	turnStart time.Time
 
 	width  int
@@ -61,13 +71,11 @@ func newRenderer(width int) *glamour.TermRenderer {
 	opts := []glamour.TermRendererOption{
 		glamour.WithWordWrap(width),
 	}
-	// 用自定义零边距样式（如果 embed 成功），否则回退 light
 	if len(styleJSON) > 0 {
 		opts = append(opts, glamour.WithStylesFromJSONBytes(styleJSON))
 	}
 	r, err := glamour.NewTermRenderer(opts...)
 	if err != nil {
-		// 回退
 		r, _ = glamour.NewTermRenderer(
 			glamour.WithStandardStyle("light"),
 			glamour.WithWordWrap(width),
@@ -77,7 +85,7 @@ func newRenderer(width int) *glamour.TermRenderer {
 }
 
 // New 创建 TUI Model
-func New(providers []config.ProviderConfig, version string) *Model {
+func New(providers []config.ProviderConfig, version string, registry *tool.Registry) *Model {
 	if len(providers) == 0 {
 		providers = []config.ProviderConfig{{Name: "default", Protocol: "anthropic", Model: "unknown"}}
 	}
@@ -97,6 +105,7 @@ func New(providers []config.ProviderConfig, version string) *Model {
 		spinner:   sp,
 		renderer:  newRenderer(80),
 		providers: providers,
+		registry:  registry,
 		conv:      &conversation.Conversation{},
 		version:   version,
 		width:     80,
@@ -158,14 +167,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-	case streamMsg:
-		return m.handleStreamEvent(msg)
+	case agentEvent:
+		return m.handleAgentEvent(msg)
 
 	case spinner.TickMsg:
 		return m.handleSpinnerTick(msg)
 	}
 
-	// 默认更新 textarea
 	var cmd tea.Cmd
 	m.textarea, cmd = m.textarea.Update(msg)
 	return m, cmd
@@ -175,7 +183,6 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m *Model) handleIdleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.Code {
 	case tea.KeyEnter:
-		// Alt+Enter → textarea 内部处理换行
 		if msg.Mod&tea.ModAlt != 0 {
 			var cmd tea.Cmd
 			m.textarea, cmd = m.textarea.Update(msg)
@@ -196,21 +203,22 @@ func (m *Model) handleIdleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.submitMessage(text)
 	}
 
-	// 其他键转发给 textarea
 	var cmd tea.Cmd
 	m.textarea, cmd = m.textarea.Update(msg)
 	return m, cmd
 }
 
-// submitMessage 提交用户消息并发起流式请求
+// submitMessage 提交用户消息并通过 agent 发起流式请求
 func (m *Model) submitMessage(text string) (tea.Model, tea.Cmd) {
 	m.conv.AddUser(text)
 
 	m.ctx, m.cancel = context.WithCancel(context.Background())
 
-	m.events = m.provider.Stream(m.ctx, m.conv.Messages())
+	a := agent.New(m.provider, m.registry)
+	m.events = a.Run(m.ctx, m.conv)
 	m.turnStart = time.Now()
 	m.curReply.Reset()
+	m.curTool = nil
 	m.state = stateStreaming
 
 	userBlock := renderUserBlock(text)
@@ -221,12 +229,37 @@ func (m *Model) submitMessage(text string) (tea.Model, tea.Cmd) {
 	)
 }
 
-// handleStreamEvent 处理流式事件
-func (m *Model) handleStreamEvent(ev streamMsg) (tea.Model, tea.Cmd) {
+// handleAgentEvent 处理 agent 事件
+func (m *Model) handleAgentEvent(ev agentEvent) (tea.Model, tea.Cmd) {
 	switch {
 	case ev.Text != "":
+		// 文本增量：累积到 curReply
 		m.curReply.WriteString(ev.Text)
 		return m, waitForEvent(m.events)
+
+	case ev.Tool != nil && ev.Tool.Phase == agent.PhaseStart:
+		// 工具开始执行：若有 preamble 文本先提交为 assistant 块
+		m.curTool = &toolDisplay{name: ev.Tool.Name, args: ev.Tool.Args}
+		if m.curReply.Len() > 0 {
+			preamble := m.curReply.String()
+			m.curReply.Reset()
+			return m, tea.Batch(
+				tea.Println(renderAssistantBlock(preamble)),
+				waitForEvent(m.events),
+			)
+		}
+		return m, waitForEvent(m.events)
+
+	case ev.Tool != nil && ev.Tool.Phase == agent.PhaseEnd:
+		// 工具执行结束：提交工具行 + 结果摘要
+		m.curTool = nil
+		tl := toolLine(ev.Tool.Name, ev.Tool.Args)
+		rs := toolResultSummary(ev.Tool.Result, ev.Tool.IsError)
+		return m, tea.Batch(
+			tea.Println(tl),
+			tea.Println(rs),
+			waitForEvent(m.events),
+		)
 
 	case ev.Err != nil:
 		errorBlock := renderErrorBlock(ev.Err.Error())
@@ -235,9 +268,8 @@ func (m *Model) handleStreamEvent(ev streamMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Println(errorBlock)
 
 	case ev.Done:
+		// 最终答复
 		fullReply := m.curReply.String()
-		m.conv.AddAssistant(fullReply)
-
 		rendered, err := m.renderer.Render(fullReply)
 		if err != nil {
 			rendered = fullReply

@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"mewcode/internal/config"
+	"mewcode/internal/tool"
 	"mewcode/internal/tui"
 )
 
@@ -18,8 +19,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 构造工具注册中心
+	reg := tool.NewDefaultRegistry()
+
 	// 启动 TUI
-	m := tui.New(cfg.Providers, version)
+	m := tui.New(cfg.Providers, version, reg)
 	if err := m.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "运行错误: %v\n", err)
 		os.Exit(1)
