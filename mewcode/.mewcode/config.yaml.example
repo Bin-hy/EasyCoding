@@ -1,0 +1,18 @@
+# MewCode LLM 供应商配置
+# 将本文件复制为 config.yaml 并填入真实的 API 密钥
+# config.yaml 已被 .gitignore 忽略，请勿提交到版本控制
+
+providers:
+  - name: "Claude"
+    protocol: "anthropic"
+    model: "claude-opus-4-8"
+    base_url: ""        # 留空使用默认端点
+    api_key: "sk-ant-..."  # 替换为真实密钥
+    thinking: true       # 启用扩展思考
+
+  # - name: "OpenAI"
+  #   protocol: "openai"
+  #   model: "gpt-5"
+  #   base_url: ""        # 留空使用默认端点，或填兼容 API 地址
+  #   api_key: "sk-..."    # 替换为真实密钥
+  #   # thinking: false    # OpenAI 不生效

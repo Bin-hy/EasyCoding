@@ -1,0 +1,82 @@
+{
+  "document": {
+    "margin": 0
+  },
+  "block_quote": {
+    "indent": 1,
+    "indent_token": "│ "
+  },
+  "paragraph": {},
+  "list": {
+    "level_indent": 2
+  },
+  "heading": {
+    "color": "27",
+    "bold": true
+  },
+  "h1": {
+    "color": "63",
+    "bold": true
+  },
+  "h2": {
+    "color": "27",
+    "bold": true
+  },
+  "h3": {
+    "color": "27",
+    "italic": true
+  },
+  "text": {},
+  "strikethrough": {
+    "crossed_out": true
+  },
+  "emph": {
+    "italic": true
+  },
+  "strong": {
+    "bold": true
+  },
+  "hr": {
+    "color": "249",
+    "format": "\n──────────────\n"
+  },
+  "item": {
+    "block_prefix": "• "
+  },
+  "enumeration": {
+    "block_prefix": ". "
+  },
+  "task": {
+    "ticked": "[✓] ",
+    "unticked": "[ ] "
+  },
+  "link": {
+    "color": "36",
+    "underline": true
+  },
+  "link_text": {
+    "color": "29",
+    "bold": true
+  },
+  "image": {
+    "color": "205",
+    "underline": true
+  },
+  "image_text": {
+    "color": "243",
+    "format": "Image: {{.text}} →"
+  },
+  "code": {
+    "color": "203"
+  },
+  "code_block": {
+    "color": "242",
+    "margin": 2
+  },
+  "table": {},
+  "definition_list": {},
+  "definition_term": {},
+  "definition_description": {},
+  "html_block": {},
+  "html_span": {}
+}
