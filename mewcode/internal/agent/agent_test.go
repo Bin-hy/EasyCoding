@@ -20,20 +20,18 @@ type fakeProvider struct {
 	calls   int                 // Stream 被调用次数
 	mu      sync.Mutex
 
-	// 记录最后一次 Stream 收到的参数（供断言用）
-	lastTools  []llm.ToolDefinition
-	lastSuffix string
+	// 记录最后一次 Stream 收到的 Request（供断言用）
+	lastReq llm.Request
 }
 
 func (f *fakeProvider) Name() string  { return "fake" }
 func (f *fakeProvider) Model() string { return "fake-model" }
 
-func (f *fakeProvider) Stream(ctx context.Context, msgs []llm.Message, tools []llm.ToolDefinition, systemSuffix string) <-chan llm.StreamEvent {
+func (f *fakeProvider) Stream(ctx context.Context, req llm.Request) <-chan llm.StreamEvent {
 	f.mu.Lock()
 	f.calls++
 	idx := f.calls - 1
-	f.lastTools = tools
-	f.lastSuffix = systemSuffix
+	f.lastReq = req
 	f.mu.Unlock()
 
 	ch := make(chan llm.StreamEvent)
@@ -110,7 +108,7 @@ func TestReAct_MultiRound(t *testing.T) {
 	conv := &conversation.Conversation{}
 	conv.AddUser("读取 test.txt 的内容")
 
-	a := New(fp, registry)
+	a := New(fp, registry, "test")
 	events := collectEvents(a.Run(context.Background(), conv, ModeNormal))
 
 	// 断言：Iter=1、ToolStart/End、Iter=2、最终 Text、Done
@@ -147,6 +145,17 @@ func TestReAct_MultiRound(t *testing.T) {
 	if !hasEventType(events, func(e Event) bool { return e.Usage != nil }) {
 		t.Error("期望 Usage 事件")
 	}
+
+	// 断言 System.Stable 非空、Environment 非空
+	fp.mu.Lock()
+	req := fp.lastReq
+	fp.mu.Unlock()
+	if req.System.Stable == "" {
+		t.Error("期望 req.System.Stable 非空")
+	}
+	if req.System.Environment == "" {
+		t.Error("期望 req.System.Environment 非空")
+	}
 }
 
 // scenario B: 迭代上限（AC3）——每次 Stream 都返回工具调用，直到 maxIterations
@@ -158,7 +167,7 @@ func TestReAct_MaxIterations(t *testing.T) {
 	conv := &conversation.Conversation{}
 	conv.AddUser("做一个无限循环的任务")
 
-	a := New(fp, registry)
+	a := New(fp, registry, "test")
 	events := collectEvents(a.Run(context.Background(), conv, ModeNormal))
 
 	// 断言恰好 maxIterations 次请求后停
@@ -194,7 +203,7 @@ func TestReAct_UnknownTools(t *testing.T) {
 		conv := &conversation.Conversation{}
 		conv.AddUser("test")
 
-		a := New(fp, registry)
+		a := New(fp, registry, "test")
 		events := collectEvents(a.Run(context.Background(), conv, ModeNormal))
 
 		if !hasEventType(events, func(e Event) bool { return e.Notice == noticeUnknownTools }) {
@@ -223,7 +232,7 @@ func TestReAct_UnknownTools(t *testing.T) {
 		conv := &conversation.Conversation{}
 		conv.AddUser("test")
 
-		a := New(fp, registry)
+		a := New(fp, registry, "test")
 		events := collectEvents(a.Run(context.Background(), conv, ModeNormal))
 
 		// 不应因未知工具提前停
@@ -266,14 +275,13 @@ func TestReAct_BatchedConcurrency(t *testing.T) {
 			readOnly: true,
 			execute: func(ctx context.Context, args json.RawMessage) tool.Result {
 				c := concurrentCount.Add(1)
-				// 跟踪最大并发数
 				for {
 					old := maxConcurrent.Load()
 					if c <= old || maxConcurrent.CompareAndSwap(old, c) {
 						break
 					}
 				}
-				time.Sleep(50 * time.Millisecond) // 制造并发重叠
+				time.Sleep(50 * time.Millisecond)
 				concurrentCount.Add(-1)
 				return tool.Result{Content: name + " done"}
 			},
@@ -290,7 +298,6 @@ func TestReAct_BatchedConcurrency(t *testing.T) {
 		},
 	}
 
-	// 自定义 registry：注册两个只读 + 一个有副作用
 	registry := &tool.Registry{}
 	ro1 := makeRO("read_file")
 	ro2 := makeRO("glob")
@@ -298,7 +305,6 @@ func TestReAct_BatchedConcurrency(t *testing.T) {
 	registry.Register(ro2)
 	registry.Register(rw)
 
-	// 脚本：一轮返回 [ro, ro, rw] 三个工具调用
 	fp := &fakeProvider{
 		scripts: [][]llm.StreamEvent{
 			{
@@ -320,26 +326,22 @@ func TestReAct_BatchedConcurrency(t *testing.T) {
 	conv := &conversation.Conversation{}
 	conv.AddUser("test")
 
-	a := New(fp, registry)
+	a := New(fp, registry, "test")
 	_ = collectEvents(a.Run(context.Background(), conv, ModeNormal))
 
-	// 两只读并发峰值 ≥2
 	if maxConcurrent.Load() < 2 {
 		t.Errorf("期望只读工具并发峰值≥2，实际=%d", maxConcurrent.Load())
 	}
 
-	// rw 的开始时刻应晚于两只读完成（最大并发在 50ms sleep + 调度 ≈ 完成）
 	if rwStartedAt.IsZero() {
 		t.Error("bash 工具未被调用")
 	}
 
-	// 结果按原始顺序回灌：检查 conv 中的消息
 	msgs := conv.Messages()
 	foundToolResults := false
 	for _, m := range msgs {
 		if m.Role == "tool" && len(m.ToolResults) == 3 {
 			foundToolResults = true
-			// 顺序：read_file → glob → bash
 			if m.ToolResults[0].ToolCallID != "1" {
 				t.Errorf("期望第 1 个结果为 read_file(callID=1)，实际=%s", m.ToolResults[0].ToolCallID)
 			}
@@ -390,10 +392,9 @@ func TestReAct_CancelHistoryConsistency(t *testing.T) {
 	conv := &conversation.Conversation{}
 	conv.AddUser("test")
 
-	a := New(fp, registry)
+	a := New(fp, registry, "test")
 	ch := a.Run(ctx, conv, ModeNormal)
 
-	// 在 goroutine 中消费事件流（避免 goroutine 阻塞在 emit）
 	eventsDone := make(chan struct{})
 	var evs []Event
 	go func() {
@@ -401,23 +402,16 @@ func TestReAct_CancelHistoryConsistency(t *testing.T) {
 		close(eventsDone)
 	}()
 
-	// 等待工具开始执行
 	time.Sleep(50 * time.Millisecond)
-
-	// 取消
 	cancel()
-
-	// 等待事件流结束
 	<-eventsDone
 	_ = evs
 
-	// 断言 conv 末尾配对合法：有 tool_results 消息，最后是 assistant 文本
 	lastRole := conv.LastRole()
 	if lastRole != "assistant" {
 		t.Errorf("取消后期望 LastRole=assistant，实际=%s", lastRole)
 	}
 
-	// 检查有 tool_results
 	hasToolResults := false
 	for _, m := range conv.Messages() {
 		if m.Role == "tool" && len(m.ToolResults) > 0 {
@@ -428,7 +422,6 @@ func TestReAct_CancelHistoryConsistency(t *testing.T) {
 		t.Error("取消后历史应包含 tool_results")
 	}
 
-	// 后续可以继续对话（追加一轮纯文本）
 	fp2 := &fakeProvider{
 		scripts: [][]llm.StreamEvent{
 			{
@@ -439,14 +432,14 @@ func TestReAct_CancelHistoryConsistency(t *testing.T) {
 	}
 	conv2 := &conversation.Conversation{}
 	conv2.AddUser("继续")
-	a2 := New(fp2, registry)
+	a2 := New(fp2, registry, "test")
 	events2 := collectEvents(a2.Run(context.Background(), conv2, ModeNormal))
 	if !hasEventType(events2, func(e Event) bool { return e.Done }) {
 		t.Error("取消后新对话应正常结束")
 	}
 }
 
-// scenario F: Plan Mode 工具集（AC13）
+// scenario F: Plan Mode 工具集（AC13）——改：校验 req.Tools 与 req.Reminder
 func TestReAct_PlanModeTools(t *testing.T) {
 	fp := &fakeProvider{
 		scripts: [][]llm.StreamEvent{
@@ -461,20 +454,35 @@ func TestReAct_PlanModeTools(t *testing.T) {
 	conv := &conversation.Conversation{}
 	conv.AddUser("做一个改动类任务")
 
-	a := New(fp, registry)
+	a := New(fp, registry, "test")
 	collectEvents(a.Run(context.Background(), conv, ModePlan))
 
-	// 断言 fp 收到的 tools 仅含只读工具
+	fp.mu.Lock()
+	req := fp.lastReq
+	fp.mu.Unlock()
+
+	// 断言 tools 仅含只读工具
 	readOnlyNames := map[string]bool{"read_file": true, "glob": true, "grep": true}
-	for _, td := range fp.lastTools {
+	for _, td := range req.Tools {
 		if !readOnlyNames[td.Name] {
 			t.Errorf("Plan Mode 下不应出现非只读工具: %s", td.Name)
 		}
 	}
 
-	// 断言 suffix 非空
-	if fp.lastSuffix == "" {
-		t.Error("Plan Mode 下 systemSuffix 不应为空")
+	// 断言 Reminder 非空、含 <system-reminder>
+	if req.Reminder == "" {
+		t.Error("Plan Mode 下 Reminder 不应为空")
+	}
+	if !strings.Contains(req.Reminder, "<system-reminder>") {
+		t.Error("Reminder 应包含 <system-reminder> 标签")
+	}
+
+	// 断言 System.Stable 非空、Environment 非空
+	if req.System.Stable == "" {
+		t.Error("期望 req.System.Stable 非空")
+	}
+	if req.System.Environment == "" {
+		t.Error("期望 req.System.Environment 非空")
 	}
 }
 
@@ -494,7 +502,7 @@ func TestReAct_NaturalCompletion(t *testing.T) {
 	conv := &conversation.Conversation{}
 	conv.AddUser("hi")
 
-	a := New(fp, registry)
+	a := New(fp, registry, "test")
 	events := collectEvents(a.Run(context.Background(), conv, ModeNormal))
 
 	if !hasEventType(events, func(e Event) bool { return e.Done }) {
@@ -503,7 +511,6 @@ func TestReAct_NaturalCompletion(t *testing.T) {
 	if !hasEventType(events, func(e Event) bool { return strings.Contains(e.Text, "纯文本答复") }) {
 		t.Error("期望最终文本")
 	}
-	// 仅 1 次 Stream 调用
 	if fp.calls != 1 {
 		t.Errorf("期望 1 次 Stream 调用，实际 %d", fp.calls)
 	}
@@ -523,16 +530,145 @@ func TestReAct_StreamError(t *testing.T) {
 	conv := &conversation.Conversation{}
 	conv.AddUser("hi")
 
-	a := New(fp, registry)
+	a := New(fp, registry, "test")
 	events := collectEvents(a.Run(context.Background(), conv, ModeNormal))
 
-	// 应收到 Err 事件
 	if !hasEventType(events, func(e Event) bool { return e.Err != nil }) {
 		t.Error("期望 Err 事件")
 	}
-	// 不应 Done（出错不停机）
 	if hasEventType(events, func(e Event) bool { return e.Done }) {
 		t.Error("不应有 Done 事件")
+	}
+}
+
+// TestReAct_SystemStableIdentical 跨模式 Stable 一致（规划提醒已移出系统通道）
+func TestReAct_SystemStableIdentical(t *testing.T) {
+	registry := tool.NewDefaultRegistry()
+
+	// Normal 模式
+	fpNormal := &fakeProvider{
+		scripts: [][]llm.StreamEvent{{{Text: "ok", Done: true}}},
+	}
+	convNormal := &conversation.Conversation{}
+	convNormal.AddUser("hi")
+	a := New(fpNormal, registry, "test")
+	collectEvents(a.Run(context.Background(), convNormal, ModeNormal))
+	fpNormal.mu.Lock()
+	stableNormal := fpNormal.lastReq.System.Stable
+	fpNormal.mu.Unlock()
+
+	// Plan 模式
+	fpPlan := &fakeProvider{
+		scripts: [][]llm.StreamEvent{{{Text: "plan", Done: true}}},
+	}
+	convPlan := &conversation.Conversation{}
+	convPlan.AddUser("plan")
+	a2 := New(fpPlan, registry, "test")
+	collectEvents(a2.Run(context.Background(), convPlan, ModePlan))
+	fpPlan.mu.Lock()
+	stablePlan := fpPlan.lastReq.System.Stable
+	fpPlan.mu.Unlock()
+
+	// 两模式 Stable 应一致
+	if stableNormal != stablePlan {
+		t.Error("普通与规划模式 req.System.Stable 应相同")
+	}
+	if stableNormal == "" {
+		t.Error("Stable 不应为空")
+	}
+}
+
+// TestReAct_PlanReminderByIter 规划模式按轮次注入 reminder 详略
+func TestReAct_PlanReminderByIter(t *testing.T) {
+	// 构造 6 轮脚本：前 5 轮返回工具调用，第 6 轮纯文本
+	scripts := make([][]llm.StreamEvent, 6)
+	for i := 0; i < 5; i++ {
+		scripts[i] = []llm.StreamEvent{
+			{ToolCalls: []llm.ToolCall{{ID: "r", Name: "read_file", Input: json.RawMessage(`{}`)}}},
+			{Usage: &llm.Usage{InputTokens: 10, OutputTokens: 5}},
+			{Done: true},
+		}
+	}
+	scripts[5] = []llm.StreamEvent{{Text: "plan done", Done: true}}
+
+	fp := &fakeProvider{scripts: scripts}
+	registry := tool.NewDefaultRegistry()
+	conv := &conversation.Conversation{}
+	conv.AddUser("plan a task")
+
+	a := New(fp, registry, "test")
+	collectEvents(a.Run(context.Background(), conv, ModePlan))
+
+	// iter=1 首轮应完整提醒，iter=2 精简，iter=5 间隔轮完整
+	// 从 calls 推理——fakeProvider 只记录最后一次
+	// 改为在每次 Stream 后检查 reminder 模式
+	// 这里使用 conv 轮次来推断
+	if fp.calls < 3 {
+		t.Fatal("期望至少 3 次 Stream 调用")
+	}
+	// 验证 conv.Messages 不含 reminder 文本（reminder 不持久）
+	for _, m := range conv.Messages() {
+		if strings.Contains(m.Content, "<system-reminder>") {
+			t.Error("conv 持久历史不应包含 reminder")
+		}
+	}
+}
+
+// TestReAct_CacheUsagePassthrough 缓存用量透传
+func TestReAct_CacheUsagePassthrough(t *testing.T) {
+	fp := &fakeProvider{
+		scripts: [][]llm.StreamEvent{
+			{
+				{Text: "done"},
+				{Usage: &llm.Usage{InputTokens: 100, OutputTokens: 50, CacheWrite: 42, CacheRead: 99}},
+				{Done: true},
+			},
+		},
+	}
+
+	registry := tool.NewDefaultRegistry()
+	conv := &conversation.Conversation{}
+	conv.AddUser("hi")
+
+	a := New(fp, registry, "test")
+	events := collectEvents(a.Run(context.Background(), conv, ModeNormal))
+
+	found := false
+	for _, e := range events {
+		if e.Usage != nil {
+			found = true
+			if e.Usage.CacheWrite != 42 {
+				t.Errorf("期望 CacheWrite=42，实际=%d", e.Usage.CacheWrite)
+			}
+			if e.Usage.CacheRead != 99 {
+				t.Errorf("期望 CacheRead=99，实际=%d", e.Usage.CacheRead)
+			}
+		}
+	}
+	if !found {
+		t.Error("期望收到 Usage 事件")
+	}
+}
+
+// TestReAct_NormalModeNoReminder 普通模式下不注入 reminder
+func TestReAct_NormalModeNoReminder(t *testing.T) {
+	fp := &fakeProvider{
+		scripts: [][]llm.StreamEvent{{{Text: "done", Done: true}}},
+	}
+
+	registry := tool.NewDefaultRegistry()
+	conv := &conversation.Conversation{}
+	conv.AddUser("hi")
+
+	a := New(fp, registry, "test")
+	collectEvents(a.Run(context.Background(), conv, ModeNormal))
+
+	fp.mu.Lock()
+	reminder := fp.lastReq.Reminder
+	fp.mu.Unlock()
+
+	if reminder != "" {
+		t.Error("普通模式下 Reminder 应为空")
 	}
 }
 

@@ -199,7 +199,7 @@ func TestEditFile_UniqueMatch(t *testing.T) {
 	os.WriteFile(path, []byte("hello world"), 0o644)
 
 	tool := &editFileTool{}
-	args, _ := json.Marshal(editFileArgs{Path: path, OldString: "hello", NewString: "hi"})
+	args, _ := json.Marshal(editFileArgs{FilePath: path, OldStr: "hello", NewStr: "hi"})
 	result := tool.Execute(context.Background(), args)
 
 	if result.IsError {
@@ -218,7 +218,7 @@ func TestEditFile_NoMatch(t *testing.T) {
 	os.WriteFile(path, []byte("hello world"), 0o644)
 
 	tool := &editFileTool{}
-	args, _ := json.Marshal(editFileArgs{Path: path, OldString: "nonexistent", NewString: "x"})
+	args, _ := json.Marshal(editFileArgs{FilePath: path, OldStr: "nonexistent", NewStr: "x"})
 	result := tool.Execute(context.Background(), args)
 
 	if !result.IsError {
@@ -235,7 +235,7 @@ func TestEditFile_MultipleMatch(t *testing.T) {
 	os.WriteFile(path, []byte("hello hello world"), 0o644)
 
 	tool := &editFileTool{}
-	args, _ := json.Marshal(editFileArgs{Path: path, OldString: "hello", NewString: "hi"})
+	args, _ := json.Marshal(editFileArgs{FilePath: path, OldStr: "hello", NewStr: "hi"})
 	result := tool.Execute(context.Background(), args)
 
 	if !result.IsError {

@@ -8,7 +8,6 @@ import (
 	"github.com/openai/openai-go/v3/option"
 	"github.com/openai/openai-go/v3/shared"
 	"mewcode/internal/config"
-	"mewcode/internal/prompt"
 
 	"github.com/openai/openai-go/v3/packages/param"
 )
@@ -26,24 +25,34 @@ func toOpenAITools(tools []ToolDefinition) []openai.ChatCompletionToolUnionParam
 	return result
 }
 
-// toOpenAIMessages 将协议无关消息列表转为 OpenAI SDK 的消息参数格式。
-// 支持 system/user/assistant/assistant+tool_calls/tool 角色。
-// systemSuffix 非空时拼接到 SystemPrompt 之后。
-func toOpenAIMessages(msgs []Message, systemSuffix string) []openai.ChatCompletionMessageParamUnion {
-	systemText := prompt.SystemPrompt
-	if systemSuffix != "" {
-		systemText += "\n\n" + systemSuffix
+// toOpenAIMessages 将 Request 转为 OpenAI SDK 的消息参数格式。
+// 首条 system 消息 = Stable + "\n\n" + Environment（单条拼接兼容端点对多条 system 支持不一）；
+// Stable 居前缀使端点前缀缓存自动命中稳定部分。
+// reminder 非空时追加一条尾部 user 消息（OpenAI 容忍连续 user）。
+func toOpenAIMessages(req Request) []openai.ChatCompletionMessageParamUnion {
+	// 构造首条 system 消息
+	var systemText string
+	if req.System.Stable != "" {
+		systemText = req.System.Stable
 	}
-	result := make([]openai.ChatCompletionMessageParamUnion, 1, len(msgs)+1)
-	result[0] = openai.SystemMessage(systemText)
+	if req.System.Environment != "" {
+		if systemText != "" {
+			systemText += "\n\n"
+		}
+		systemText += req.System.Environment
+	}
 
-	for _, m := range msgs {
+	result := make([]openai.ChatCompletionMessageParamUnion, 0, len(req.Messages)+2)
+	if systemText != "" {
+		result = append(result, openai.SystemMessage(systemText))
+	}
+
+	for _, m := range req.Messages {
 		switch m.Role {
 		case RoleUser:
 			result = append(result, openai.UserMessage(m.Content))
 		case RoleAssistant:
 			if len(m.ToolCalls) > 0 {
-				// 手工构造 assistant 消息带 tool_calls
 				var toolCalls []openai.ChatCompletionMessageToolCallUnionParam
 				for _, tc := range m.ToolCalls {
 					toolCalls = append(toolCalls, openai.ChatCompletionMessageToolCallUnionParam{
@@ -59,7 +68,6 @@ func toOpenAIMessages(msgs []Message, systemSuffix string) []openai.ChatCompleti
 				assistantMsg := openai.ChatCompletionAssistantMessageParam{
 					ToolCalls: toolCalls,
 				}
-				// 仅当有文本时才设置 Content；空内容省略避免 "content":"" 被 API 拒绝
 				if m.Content != "" {
 					assistantMsg.Content = openai.ChatCompletionAssistantMessageParamContentUnion{
 						OfString: param.Opt[string]{Value: m.Content},
@@ -72,12 +80,17 @@ func toOpenAIMessages(msgs []Message, systemSuffix string) []openai.ChatCompleti
 				result = append(result, openai.AssistantMessage(m.Content))
 			}
 		case RoleTool:
-			// 每个 tool_result 发一条 tool 消息
 			for _, tr := range m.ToolResults {
 				result = append(result, openai.ToolMessage(tr.Content, tr.ToolCallID))
 			}
 		}
 	}
+
+	// reminder 注入：追加尾部 user 消息（OpenAI 容忍连续 user）
+	if req.Reminder != "" {
+		result = append(result, openai.UserMessage(req.Reminder))
+	}
+
 	return result
 }
 
@@ -101,14 +114,14 @@ func newOpenAIProvider(cfg config.ProviderConfig) (Provider, error) {
 func (p *openaiProvider) Name() string  { return p.cfg.Name }
 func (p *openaiProvider) Model() string { return p.cfg.Model }
 
-func (p *openaiProvider) Stream(ctx context.Context, msgs []Message, tools []ToolDefinition, systemSuffix string) <-chan StreamEvent {
+func (p *openaiProvider) Stream(ctx context.Context, req Request) <-chan StreamEvent {
 	ch := make(chan StreamEvent)
 
 	go func() {
 		defer close(ch)
 
 		// 构造消息参数
-		messages := toOpenAIMessages(msgs, systemSuffix)
+		messages := toOpenAIMessages(req)
 
 		params := openai.ChatCompletionNewParams{
 			Model:    openai.ChatModel(p.cfg.Model),
@@ -119,8 +132,8 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message, tools []Too
 		}
 
 		// 注入工具定义
-		if len(tools) > 0 {
-			params.Tools = toOpenAITools(tools)
+		if len(req.Tools) > 0 {
+			params.Tools = toOpenAITools(req.Tools)
 		}
 
 		// 发起流式请求
@@ -153,10 +166,15 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message, tools []Too
 			return
 		}
 
-		// 上抛本轮 token 用量（流结束后 acc.Usage 完整）
+		// 上抛本轮 token 用量（流结束后 acc.Usage 完整；含缓存字段 F4/N6）
 		if acc.Usage.PromptTokens > 0 || acc.Usage.CompletionTokens > 0 {
 			select {
-			case ch <- StreamEvent{Usage: &Usage{InputTokens: int64(acc.Usage.PromptTokens), OutputTokens: int64(acc.Usage.CompletionTokens)}}:
+			case ch <- StreamEvent{Usage: &Usage{
+				InputTokens:  int64(acc.Usage.PromptTokens),
+				OutputTokens: int64(acc.Usage.CompletionTokens),
+				CacheWrite:   0,
+				CacheRead:    int64(acc.Usage.PromptTokensDetails.CachedTokens),
+			}}:
 			case <-ctx.Done():
 				return
 			}
@@ -166,7 +184,6 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message, tools []Too
 		if len(acc.Choices) > 0 && len(acc.Choices[0].Message.ToolCalls) > 0 {
 			var calls []ToolCall
 			for _, tc := range acc.Choices[0].Message.ToolCalls {
-				// 空 args 归一为 {}
 				args := tc.Function.Arguments
 				if args == "" {
 					args = "{}"

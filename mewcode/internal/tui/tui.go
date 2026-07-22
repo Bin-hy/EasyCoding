@@ -252,7 +252,7 @@ func (m *Model) submitMessage(text string) (tea.Model, tea.Cmd) {
 	turnCtx, turnCancel := context.WithCancel(context.Background())
 	m.turnCancel = turnCancel
 
-	a := agent.New(m.provider, m.registry)
+	a := agent.New(m.provider, m.registry, m.version)
 	m.events = a.Run(turnCtx, m.conv, m.mode)
 	m.turnStart = time.Now()
 	m.curReply.Reset()

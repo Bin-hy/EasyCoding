@@ -5,23 +5,32 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
-	"runtime"
+	"path/filepath"
 	"strings"
+	"time"
 )
 
-// bashArgs 执行命令工具的参数
+// bashArgs bash 工具参数
 type bashArgs struct {
-	Command string `json:"command"`
+	Command     string `json:"command"`
+	Description string `json:"description"`
+	Timeout     int    `json:"timeout"`
+	Workdir     string `json:"workdir"`
 }
 
-// bashTool 执行 shell 命令，返回 stdout/stderr/退出码
+// bashTool 执行 shell 命令
 type bashTool struct{}
 
 func (t *bashTool) Name() string   { return "bash" }
 func (t *bashTool) ReadOnly() bool { return false }
+
+// Description 返回给模型的工具用途说明。
+// 末尾强化：读文件/找文件/搜内容请优先用专用工具而非 bash 拼凑。
 func (t *bashTool) Description() string {
-	return "执行 shell 命令，返回标准输出、标准错误与退出码。受超时约束，超时或非零退出以结构化结果返回，不中断会话。"
+	return "执行 shell 命令并返回输出。读文件、找文件、搜内容请优先用 " +
+		"read_file / glob / grep 专用工具，不要用 bash 拼凑 cat/find/grep 等命令来替代。"
 }
 
 func (t *bashTool) Parameters() map[string]any {
@@ -31,6 +40,18 @@ func (t *bashTool) Parameters() map[string]any {
 			"command": map[string]any{
 				"type":        "string",
 				"description": "要执行的 shell 命令",
+			},
+			"description": map[string]any{
+				"type":        "string",
+				"description": "命令用途说明",
+			},
+			"timeout": map[string]any{
+				"type":        "integer",
+				"description": "超时(毫秒)，默认 120000",
+			},
+			"workdir": map[string]any{
+				"type":        "string",
+				"description": "工作目录，不填则使用当前工作目录",
 			},
 		},
 		"required": []string{"command"},
@@ -50,60 +71,70 @@ func (t *bashTool) Execute(ctx context.Context, args json.RawMessage) Result {
 		return errorResult("参数 command 不能为空")
 	}
 
-	// 按平台选 shell
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, "cmd", "/C", a.Command)
-	} else {
-		cmd = exec.CommandContext(ctx, "sh", "-c", a.Command)
+	timeout := time.Duration(a.Timeout) * time.Millisecond
+	if a.Timeout <= 0 {
+		timeout = 120 * time.Second
 	}
 
-	// 捕获合并 stdout/stderr
-	var outBuf bytes.Buffer
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &outBuf
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	// 安全检查: workdir 不能使用绝对路径或路径穿越
+	if a.Workdir != "" {
+		if filepath.IsAbs(a.Workdir) || strings.Contains(a.Workdir, "..") {
+			return errorResult("安全限制: workdir 不支持绝对路径或路径穿越")
+		}
+	}
+
+	cmd := exec.CommandContext(ctx, "sh", "-c", a.Command)
+	cmd.Dir = a.Workdir
+
+	// 不继承环境变量（N5: 密钥不泄漏）
+	cmd.Env = []string{
+		"HOME=" + os.Getenv("HOME"),
+		"PATH=" + os.Getenv("PATH"),
+		"USER=" + os.Getenv("USER"),
+		"TERM=" + os.Getenv("TERM"),
+	}
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
 	err := cmd.Run()
 
-	// 检查超时或取消
-	if ctx.Err() != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return Result{
-				Content: "命令执行超时",
-				IsError: true,
-			}
+	output := stdout.String()
+	if stderr.Len() > 0 {
+		if output != "" {
+			output += "\n"
 		}
-		return Result{
-			Content: "命令已被取消",
-			IsError: true,
-		}
+		output += stderr.String()
 	}
 
-	output := strings.TrimRight(outBuf.String(), "\n")
+	// 结果截断
+	output = strings.TrimSpace(output)
+	output = truncate(output, 200, 8000)
 
-	var result strings.Builder
-	if output != "" {
-		result.WriteString(output)
-	}
-
-	// 退出码信息
-	exitCode := 0
 	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return errorResult("命令超时: %s", err)
+		}
+		// 提取退出码
+		exitCode := -1
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
-		} else {
-			return errorResult("命令执行失败: %v", err)
+		}
+		if output == "" {
+			return errorResult("exit_code: %d\n命令执行失败: %v", exitCode, err)
+		}
+		return Result{
+			Content: fmt.Sprintf("exit_code: %d\n%s", exitCode, output),
+			IsError: false,
 		}
 	}
 
-	if result.Len() > 0 {
-		result.WriteString("\n")
+	if output == "" {
+		output = "(无输出)"
 	}
-	result.WriteString(fmt.Sprintf("exit_code: %d", exitCode))
-
-	// 截断输出 ~30000 字符
-	content := truncate(result.String(), 500, 30000)
-
-	// 非零退出不设 IsError，按结果回灌让模型判断
-	return Result{Content: content}
+	return Result{Content: "exit_code: 0\n" + output}
 }

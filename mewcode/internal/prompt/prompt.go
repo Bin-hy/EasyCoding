@@ -1,34 +1,36 @@
 package prompt
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
+	"strings"
+)
 
-// SystemPrompt 内置固定 system prompt
-const SystemPrompt = `你是 MewCode，一个终端 AI 编程助手，你可以使用工具来完成用户的请求。
+// AssembleSystem 按 Priority 升序排列模块，跳过 Content 为空的模块，以 "\n\n" 连接。
+// 排序稳定以保证跨调用逐字节一致（N1 缓存确定性）。
+func AssembleSystem(mods []Module) string {
+	// 防御性拷贝后排序，避免副作用
+	sorted := make([]Module, len(mods))
+	copy(sorted, mods)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i].Priority < sorted[j].Priority
+	})
 
-你有以下能力：
-- 读取文件内容（read_file）
-- 写入/覆盖文件（write_file）
-- 修改文件中的内容片段（edit_file）
-- 执行 shell 命令（bash）
-- 按 glob 模式搜索文件（glob）
-- 在文件内容中搜索文本（grep）
+	var parts []string
+	for _, m := range sorted {
+		if m.Content != "" {
+			parts = append(parts, m.Content)
+		}
+	}
+	return strings.Join(parts, "\n\n")
+}
 
-工作方式：
-- 当需要查看文件、搜索代码或执行命令时，主动调用相应工具
-- 拿到工具执行结果后，基于结果给出简洁清晰的回答
-- Keep using tools across multiple steps to make progress, and only give your final concise answer once the task is complete.
-- 代码片段使用 markdown 代码块格式
-- 使用中文回答`
-
-// PlanModeReminder Plan Mode 系统提示后缀，拼接到 SystemPrompt 之后。
-// 计划态下限制模型只能使用只读工具调研并产出计划。
-const PlanModeReminder = "You are currently in PLAN MODE. You may use ONLY the read-only tools " +
-	"(read_file, glob, grep) to investigate the codebase. You must NOT write files, edit files, " +
-	"or run shell commands. Produce a clear, step-by-step plan for the task, then stop and wait for " +
-	"the user to approve it with /do before doing any work."
-
-// ExecuteDirective /do 注入的用户消息——指示模型按上文已确认的计划开始执行。
-const ExecuteDirective = "请按上面的计划开始执行。"
+// BuildSystemPrompt 返回完整的稳定系统提示：固定七模块 + 可选三空槽拼接。
+// 可选槽 Content 为空时自动跳过，不留多余空行。
+func BuildSystemPrompt() string {
+	all := append(FixedModules(), OptionalModules()...)
+	return AssembleSystem(all)
+}
 
 // LogoBanner MEWCODE ASCII 艺术字
 const LogoBanner = `███╗   ███╗███████╗██╗    ██╗ ██████╗ ██████╗ ██████╗ ███████╗

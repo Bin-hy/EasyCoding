@@ -8,40 +8,44 @@ import (
 	"strings"
 )
 
-// editFileArgs 改文件工具的参数
+// editFileArgs edit_file 工具参数
 type editFileArgs struct {
-	Path      string `json:"path"`
-	OldString string `json:"old_string"`
-	NewString string `json:"new_string"`
+	FilePath string `json:"file_path"`
+	OldStr   string `json:"old_string"`
+	NewStr   string `json:"new_string"`
 }
 
-// editFileTool 对原文片段做唯一匹配替换
+// editFileTool 精确替换文件中的文本片段
 type editFileTool struct{}
 
 func (t *editFileTool) Name() string   { return "edit_file" }
 func (t *editFileTool) ReadOnly() bool { return false }
+
+// Description 返回给模型的工具用途说明。
+// 末尾强化：编辑前必须先 read_file 确认目标文件和 old_string 唯一。
 func (t *editFileTool) Description() string {
-	return "对文件中的原文片段做唯一匹配替换。匹配 0 次或多于 1 次时返回清晰错误，让模型据此重试。"
+	return "精确替换文件中的文本片段。通过 old_string 定位要替换的内容，替换为 new_string。" +
+		"编辑前请先用 read_file 读取目标文件，确认 old_string 在文件中唯一存在，确保替换精准无误。"
 }
 
 func (t *editFileTool) Parameters() map[string]any {
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
-			"path": map[string]any{
+			"file_path": map[string]any{
 				"type":        "string",
-				"description": "要修改的文件路径",
+				"description": "要编辑的文件路径",
 			},
 			"old_string": map[string]any{
 				"type":        "string",
-				"description": "要替换的原文片段（需在文件中唯一匹配）",
+				"description": "要在文件中定位并替换的文本",
 			},
 			"new_string": map[string]any{
 				"type":        "string",
-				"description": "替换后的新文本片段",
+				"description": "替换为新文本",
 			},
 		},
-		"required": []string{"path", "old_string", "new_string"},
+		"required": []string{"file_path", "old_string", "new_string"},
 	}
 }
 
@@ -54,35 +58,46 @@ func (t *editFileTool) Execute(ctx context.Context, args json.RawMessage) Result
 	if err := json.Unmarshal(args, &a); err != nil {
 		return errorResult("参数解析失败: %v", err)
 	}
-	if a.Path == "" {
-		return errorResult("参数 path 不能为空")
+	if a.FilePath == "" {
+		return errorResult("参数 file_path 不能为空")
 	}
-	if a.OldString == "" {
+	if a.OldStr == "" {
 		return errorResult("参数 old_string 不能为空")
 	}
 
-	// 读取文件
-	data, err := os.ReadFile(a.Path)
+	// 安全检查: 路径不能包含 .. 越界
+	if strings.Contains(a.FilePath, "..") {
+		return errorResult("安全限制: file_path 不支持路径穿越")
+	}
+
+	content, err := os.ReadFile(a.FilePath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return errorResult("文件不存在: %s", a.Path)
-		}
 		return errorResult("读取文件失败: %v", err)
 	}
 
-	content := string(data)
-	n := strings.Count(content, a.OldString)
+	text := string(content)
 
-	switch n {
-	case 0:
-		return errorResult("未找到匹配的内容，请检查 old_string 是否正确")
-	case 1:
-		newContent := strings.Replace(content, a.OldString, a.NewString, 1)
-		if err := os.WriteFile(a.Path, []byte(newContent), 0o644); err != nil {
-			return errorResult("写入文件失败: %v", err)
-		}
-		return Result{Content: fmt.Sprintf("已成功替换 %s 中的 1 处匹配", a.Path)}
-	default:
-		return errorResult("匹配到 %d 处，old_string 不唯一，请提供更长上下文使其唯一", n)
+	// 检查 old_string 唯一性
+	count := strings.Count(text, a.OldStr)
+	if count == 0 {
+		return errorResult("未找到匹配: old_string 在文件中不存在")
 	}
+	if count > 1 {
+		return errorResult("old_string 在文件中不唯一: 出现 %d 次——请用 read_file 查看文件，选择唯一匹配片段", count)
+	}
+
+	// 执行替换（仅第一处——唯一时等价于唯一替换）
+	newText := strings.Replace(text, a.OldStr, a.NewStr, 1)
+
+	// 保留文件权限写回
+	info, _ := os.Stat(a.FilePath)
+	perm := os.FileMode(0644)
+	if info != nil {
+		perm = info.Mode().Perm()
+	}
+	if err := os.WriteFile(a.FilePath, []byte(newText), perm); err != nil {
+		return errorResult("写入文件失败: %v", err)
+	}
+
+	return Result{Content: fmt.Sprintf("文件 %s 已编辑: 1 处替换", a.FilePath)}
 }

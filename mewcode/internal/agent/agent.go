@@ -34,8 +34,10 @@ type ToolEvent struct {
 
 // Usage 一轮请求的 token 用量（透传 llm.Usage 语义）。
 type Usage struct {
-	Input  int64 // 本轮输入 token 数
-	Output int64 // 本轮输出 token 数
+	Input      int64 // 本轮输入 token 数
+	Output     int64 // 本轮输出 token 数
+	CacheWrite int64 // 缓存写入 token（首次创建缓存）
+	CacheRead  int64 // 缓存读取 token（命中复用）
 }
 
 // Mode 区分普通模式与计划模式。
@@ -61,17 +63,19 @@ type Event struct {
 type Agent struct {
 	provider llm.Provider
 	registry *tool.Registry
+	version  string // 应用版本，供环境段采集
 }
 
 // New 创建 Agent。
-func New(p llm.Provider, r *tool.Registry) *Agent {
-	return &Agent{provider: p, registry: r}
+func New(p llm.Provider, r *tool.Registry, version string) *Agent {
+	return &Agent{provider: p, registry: r, version: version}
 }
 
 // 迭代与停止常量（内置，不可配）
 const (
-	maxIterations = 25 // 迭代上限兜底（F2）
-	maxUnknownRun = 3  // 连续「整轮只产生未知工具调用」的迭代数上限（F2）
+	maxIterations        = 25 // 迭代上限兜底（F2）
+	maxUnknownRun        = 3  // 连续「整轮只产生未知工具调用」的迭代数上限（F2）
+	planReminderInterval = 4  // 规划模式下每隔 planReminderInterval 轮重复完整提醒（含首轮）
 )
 
 // 停止/收尾提示文案——既作为 Event{Notice} 推给 UI，也作为 ensureAssistantTail 写入历史的兜底文本。
@@ -89,17 +93,19 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode M
 	go func() {
 		defer close(ch)
 
-		// 按 mode 取工具集与系统后缀
+		// 采集环境信息与装配稳定系统提示（Run 起始一次，跨轮复用）
+		env := prompt.GatherEnvironment(a.version, a.provider.Model())
+		sys := prompt.BuildSystemPrompt()
+
+		// 按 mode 取工具集
 		var defs []llm.ToolDefinition
-		var suffix string
 		if mode == ModePlan {
 			defs = a.registry.ReadOnlyDefinitions()
-			suffix = prompt.PlanModeReminder
 		} else {
 			defs = a.registry.Definitions()
-			suffix = ""
 		}
 
+		envText := env.Render()
 		unknownRun := 0
 
 		for iter := 1; iter <= maxIterations; iter++ {
@@ -109,8 +115,15 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode M
 				return
 			}
 
+			// 按轮次计算规划模式 reminder
+			var reminder string
+			if mode == ModePlan {
+				full := iter == 1 || (iter-1)%planReminderInterval == 0
+				reminder = prompt.PlanReminder(full)
+			}
+
 			// 流式请求本轮
-			text, calls, usage, ok := streamOnce(ctx, a.provider, conv.Messages(), defs, suffix, ch)
+			text, calls, usage, ok := streamOnce(ctx, a.provider, conv.Messages(), defs, sys, envText, reminder, ch)
 			if !ok && ctx.Err() != nil {
 				// ctx 取消
 				finishCancelled(conv)
@@ -122,9 +135,14 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode M
 				return
 			}
 
-			// Usage 事件（F8）
+			// Usage 事件（含缓存字段 F4）
 			if usage != nil {
-				emit(ctx, ch, Event{Usage: &Usage{Input: usage.InputTokens, Output: usage.OutputTokens}})
+				emit(ctx, ch, Event{Usage: &Usage{
+					Input:      usage.InputTokens,
+					Output:     usage.OutputTokens,
+					CacheWrite: usage.CacheWrite,
+					CacheRead:  usage.CacheRead,
+				}})
 			}
 
 			// 无工具调用：自然完成（F2-1）
@@ -177,10 +195,17 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode M
 
 // streamOnce 发起一次流式请求，将 Text 增量转发到 ch，返回累积的完整文本、工具调用列表、本轮用量。
 // 出错时返回 ok=false；ctx 取消也算不 ok。
-func streamOnce(ctx context.Context, provider llm.Provider, msgs []llm.Message, tools []llm.ToolDefinition, suffix string, ch chan<- Event) (text string, calls []llm.ToolCall, usage *llm.Usage, ok bool) {
+func streamOnce(ctx context.Context, provider llm.Provider, msgs []llm.Message, tools []llm.ToolDefinition, sys, envText, reminder string, ch chan<- Event) (text string, calls []llm.ToolCall, usage *llm.Usage, ok bool) {
 	var textBuilder strings.Builder
 
-	stream := provider.Stream(ctx, msgs, tools, suffix)
+	req := llm.Request{
+		Messages: msgs,
+		Tools:    tools,
+		System:   llm.System{Stable: sys, Environment: envText},
+		Reminder: reminder,
+	}
+
+	stream := provider.Stream(ctx, req)
 	for ev := range stream {
 		switch {
 		case ev.Err != nil:
@@ -400,14 +425,11 @@ func allUnknown(registry *tool.Registry, calls []llm.ToolCall) bool {
 }
 
 // ensureFinal 确保最终文本非空；为空时返回占位文本（避免空 assistant 回合破坏下一轮请求）。
-// ensureFinal 确保最终文本非空；为空时返回占位文本（避免空 assistant 回合破坏下一轮请求）。
-// 此处不阻塞发送——Run 已收到无工具调用的纯文本，channel 必然在消费中。
 func ensureFinal(ch chan<- Event, text string) string {
 	if text != "" {
 		return text
 	}
 	placeholder := "（任务已完成）"
-	// 不使用 ctx 阻塞发送（仅在最终文本为空时触发，channel 必然在消费中）
 	select {
 	case ch <- Event{Text: placeholder}:
 	default:
@@ -434,7 +456,6 @@ func argPreview(input json.RawMessage) string {
 	if err := json.Unmarshal(input, &args); err != nil {
 		return ""
 	}
-	// 优先展示：path > command > pattern > old_string > content
 	preferKeys := []string{"path", "command", "pattern", "old_string"}
 	for _, key := range preferKeys {
 		if v, ok := args[key]; ok {
@@ -445,7 +466,6 @@ func argPreview(input json.RawMessage) string {
 			return s
 		}
 	}
-	// 否则取第一个 string 字段
 	for _, v := range args {
 		s := fmt.Sprint(v)
 		if len(s) > 60 {

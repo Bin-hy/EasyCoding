@@ -7,7 +7,6 @@ import (
 	anthropic "github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
 	"mewcode/internal/config"
-	"mewcode/internal/prompt"
 )
 
 // toAnthropicTools 将协议无关工具定义转为 Anthropic SDK 的工具参数格式。
@@ -116,38 +115,70 @@ func newAnthropicProvider(cfg config.ProviderConfig) (Provider, error) {
 func (p *anthropicProvider) Name() string  { return p.cfg.Name }
 func (p *anthropicProvider) Model() string { return p.cfg.Model }
 
-// effectiveSystem 按 suffix 拼接最终 system prompt。空 suffix 时返回单块 SystemPrompt；非空时拼接。
-func effectiveSystem(suffix string) []anthropic.TextBlockParam {
-	text := prompt.SystemPrompt
-	if suffix != "" {
-		text += "\n\n" + suffix
+// toAnthropicSystem 将 System 转为 Anthropic TextBlockParam 列表。
+// Stable 块打缓存断点（必须用 NewCacheControlEphemeralParam 构造器，空字面量会被 omitzero 丢弃）；
+// Environment 块不打缓存断点。
+func toAnthropicSystem(sys System) []anthropic.TextBlockParam {
+	var blocks []anthropic.TextBlockParam
+	if sys.Stable != "" {
+		blocks = append(blocks, anthropic.TextBlockParam{
+			Text:         sys.Stable,
+			CacheControl: anthropic.NewCacheControlEphemeralParam(),
+		})
 	}
-	return []anthropic.TextBlockParam{{Text: text}}
+	if sys.Environment != "" {
+		blocks = append(blocks, anthropic.TextBlockParam{
+			Text: sys.Environment,
+		})
+	}
+	return blocks
 }
 
-func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message, tools []ToolDefinition, systemSuffix string) <-chan StreamEvent {
+// appendReminderAnthropic 把 reminder 并入最后一条 user 消息的 content 块。
+// 末条非 user 时新起一条 user 消息。确保角色交替合法（N3）。
+func appendReminderAnthropic(msgs []anthropic.MessageParam, reminder string) []anthropic.MessageParam {
+	if len(msgs) == 0 {
+		return append(msgs, anthropic.NewUserMessage(anthropic.NewTextBlock(reminder)))
+	}
+	last := &msgs[len(msgs)-1]
+	if last.Role == anthropic.MessageParamRoleUser {
+		// 把 reminder 作为新的文本块追加到已有 user 消息
+		last.Content = append(last.Content, anthropic.NewTextBlock(reminder))
+	} else {
+		// 末条不是 user，新起一条 user 消息
+		msgs = append(msgs, anthropic.NewUserMessage(anthropic.NewTextBlock(reminder)))
+	}
+	return msgs
+}
+
+func (p *anthropicProvider) Stream(ctx context.Context, req Request) <-chan StreamEvent {
 	ch := make(chan StreamEvent)
 
 	go func() {
 		defer close(ch)
 
 		// 构造消息参数
-		messages := toAnthropicMessages(msgs)
+		messages := toAnthropicMessages(req.Messages)
+
+		// reminder 织入：并入最后一条 user 消息（确保角色交替合法 N3）
+		if req.Reminder != "" {
+			messages = appendReminderAnthropic(messages, req.Reminder)
+		}
 
 		params := anthropic.MessageNewParams{
 			Model:     anthropic.Model(p.cfg.Model),
 			MaxTokens: 4096,
-			System:    effectiveSystem(systemSuffix),
+			System:    toAnthropicSystem(req.System),
 			Messages:  messages,
 		}
 
 		// 注入工具定义
-		if len(tools) > 0 {
-			params.Tools = toAnthropicTools(tools)
+		if len(req.Tools) > 0 {
+			params.Tools = toAnthropicTools(req.Tools)
 		}
 
 		// 启用扩展思考（历史含工具交互时关闭，避免 400）
-		if p.cfg.Thinking && !hasToolHistory(msgs) {
+		if p.cfg.Thinking && !hasToolHistory(req.Messages) {
 			params.Thinking = anthropic.ThinkingConfigParamOfEnabled(16000)
 		}
 
@@ -192,10 +223,15 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message, tools []
 			return
 		}
 
-		// 上抛本轮 token 用量（流结束后 acc.Usage 完整）
+		// 上抛本轮 token 用量（流结束后 acc.Usage 完整；含缓存字段 F4/N6）
 		if acc.Usage.InputTokens > 0 || acc.Usage.OutputTokens > 0 {
 			select {
-			case ch <- StreamEvent{Usage: &Usage{InputTokens: int64(acc.Usage.InputTokens), OutputTokens: int64(acc.Usage.OutputTokens)}}:
+			case ch <- StreamEvent{Usage: &Usage{
+				InputTokens:  int64(acc.Usage.InputTokens),
+				OutputTokens: int64(acc.Usage.OutputTokens),
+				CacheWrite:   int64(acc.Usage.CacheCreationInputTokens),
+				CacheRead:    int64(acc.Usage.CacheReadInputTokens),
+			}}:
 			case <-ctx.Done():
 				return
 			}

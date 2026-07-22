@@ -35,10 +35,10 @@ func main() {
 	reg := tool.NewDefaultRegistry()
 	conv := &conversation.Conversation{}
 
-	// 场景1：多轮工具调用
+	// 场景1：多轮工具调用（含缓存用量打印）
 	fmt.Println("=== 场景1: 多轮工具调用 ===")
 	ctx := context.Background()
-	a := agent.New(p, reg)
+	a := agent.New(p, reg, "dev")
 
 	conv.AddUser("帮我读 docs/ch03/spec.md 文件，用一句话总结它说了什么")
 
@@ -54,7 +54,8 @@ func main() {
 		case ev.Iter > 0:
 			iter = ev.Iter
 		case ev.Usage != nil:
-			fmt.Printf("[usage] in=%d out=%d\n", ev.Usage.Input, ev.Usage.Output)
+			fmt.Printf("[usage] in=%d out=%d cache_write=%d cache_read=%d\n",
+				ev.Usage.Input, ev.Usage.Output, ev.Usage.CacheWrite, ev.Usage.CacheRead)
 		case ev.Notice != "":
 			fmt.Printf("[notice] %s\n", ev.Notice)
 		case ev.Err != nil:
