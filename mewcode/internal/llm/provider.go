@@ -44,10 +44,17 @@ type Message struct {
 	ToolResults []ToolResult // 仅 RoleTool：工具执行结果（一条消息可含多个）
 }
 
-// StreamEvent 流式事件的四态语义：
+// Usage 协议无关地承载一轮请求的 token 用量。
+type Usage struct {
+	InputTokens  int64 // 本轮请求输入（含完整历史）token 数
+	OutputTokens int64 // 本轮响应输出 token 数
+}
+
+// StreamEvent 流式事件的五态语义：
 //
 //	Text 非空 → 文本增量（正文或 preamble）
 //	ToolCalls 非空 → 模型请求执行这些工具（Done 之前发出）
+//	Usage 非空 → 本轮 token 用量（Done 之前一次性发出）
 //	Done → 本轮正常结束
 //	Err 非空 → 出错
 //
@@ -55,15 +62,16 @@ type Message struct {
 type StreamEvent struct {
 	Text      string     // 文本增量
 	ToolCalls []ToolCall // 非空：本轮模型请求执行这些工具
+	Usage     *Usage     // 非空：本轮 token 用量（Done 之前一次性发出）
 	Done      bool       // 本轮正常结束
 	Err       error      // 出错
 }
 
 // Provider LLM 协议无关的统一接口
 type Provider interface {
-	Name() string                                                                          // 状态栏左侧：供应商名称
-	Model() string                                                                         // 状态栏右侧：模型名
-	Stream(ctx context.Context, msgs []Message, tools []ToolDefinition) <-chan StreamEvent // 发起一轮流式对话
+	Name() string                                                                                               // 状态栏左侧：供应商名称
+	Model() string                                                                                              // 状态栏右侧：模型名
+	Stream(ctx context.Context, msgs []Message, tools []ToolDefinition, systemSuffix string) <-chan StreamEvent // 发起一轮流式对话；systemSuffix 非空时拼接到内置 SystemPrompt 之后（Plan Mode）
 }
 
 // New 按 protocol 构造对应的适配器

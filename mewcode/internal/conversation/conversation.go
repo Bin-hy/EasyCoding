@@ -45,3 +45,11 @@ func (c *Conversation) Messages() []llm.Message {
 func (c *Conversation) Len() int {
 	return len(c.messages)
 }
+
+// LastRole 返回最后一条消息的角色；空历史返回 ""。
+func (c *Conversation) LastRole() string {
+	if len(c.messages) == 0 {
+		return ""
+	}
+	return c.messages[len(c.messages)-1].Role
+}

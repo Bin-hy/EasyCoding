@@ -28,9 +28,14 @@ func toOpenAITools(tools []ToolDefinition) []openai.ChatCompletionToolUnionParam
 
 // toOpenAIMessages 将协议无关消息列表转为 OpenAI SDK 的消息参数格式。
 // 支持 system/user/assistant/assistant+tool_calls/tool 角色。
-func toOpenAIMessages(msgs []Message) []openai.ChatCompletionMessageParamUnion {
+// systemSuffix 非空时拼接到 SystemPrompt 之后。
+func toOpenAIMessages(msgs []Message, systemSuffix string) []openai.ChatCompletionMessageParamUnion {
+	systemText := prompt.SystemPrompt
+	if systemSuffix != "" {
+		systemText += "\n\n" + systemSuffix
+	}
 	result := make([]openai.ChatCompletionMessageParamUnion, 1, len(msgs)+1)
-	result[0] = openai.SystemMessage(prompt.SystemPrompt)
+	result[0] = openai.SystemMessage(systemText)
 
 	for _, m := range msgs {
 		switch m.Role {
@@ -96,18 +101,21 @@ func newOpenAIProvider(cfg config.ProviderConfig) (Provider, error) {
 func (p *openaiProvider) Name() string  { return p.cfg.Name }
 func (p *openaiProvider) Model() string { return p.cfg.Model }
 
-func (p *openaiProvider) Stream(ctx context.Context, msgs []Message, tools []ToolDefinition) <-chan StreamEvent {
+func (p *openaiProvider) Stream(ctx context.Context, msgs []Message, tools []ToolDefinition, systemSuffix string) <-chan StreamEvent {
 	ch := make(chan StreamEvent)
 
 	go func() {
 		defer close(ch)
 
 		// 构造消息参数
-		messages := toOpenAIMessages(msgs)
+		messages := toOpenAIMessages(msgs, systemSuffix)
 
 		params := openai.ChatCompletionNewParams{
 			Model:    openai.ChatModel(p.cfg.Model),
 			Messages: messages,
+			StreamOptions: openai.ChatCompletionStreamOptionsParam{
+				IncludeUsage: openai.Bool(true),
+			},
 		}
 
 		// 注入工具定义
@@ -143,6 +151,15 @@ func (p *openaiProvider) Stream(ctx context.Context, msgs []Message, tools []Too
 			case <-ctx.Done():
 			}
 			return
+		}
+
+		// 上抛本轮 token 用量（流结束后 acc.Usage 完整）
+		if acc.Usage.PromptTokens > 0 || acc.Usage.CompletionTokens > 0 {
+			select {
+			case ch <- StreamEvent{Usage: &Usage{InputTokens: int64(acc.Usage.PromptTokens), OutputTokens: int64(acc.Usage.CompletionTokens)}}:
+			case <-ctx.Done():
+				return
+			}
 		}
 
 		// 检查是否有工具调用

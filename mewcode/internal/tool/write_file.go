@@ -17,7 +17,8 @@ type writeFileArgs struct {
 // writeFileTool 写入（覆盖）文件，父目录不存在时自动创建
 type writeFileTool struct{}
 
-func (t *writeFileTool) Name() string { return "write_file" }
+func (t *writeFileTool) Name() string   { return "write_file" }
+func (t *writeFileTool) ReadOnly() bool { return false }
 func (t *writeFileTool) Description() string {
 	return "写入（覆盖）文件内容。父目录不存在时自动创建，返回成功或结构化错误。"
 }

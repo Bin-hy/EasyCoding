@@ -50,6 +50,28 @@ func (r *Registry) Definitions() []llm.ToolDefinition {
 	return defs
 }
 
+// ReadOnlyDefinitions 按注册顺序仅导出只读工具的定义（Plan Mode 使用）。
+func (r *Registry) ReadOnlyDefinitions() []llm.ToolDefinition {
+	defs := make([]llm.ToolDefinition, 0, len(r.order))
+	for _, name := range r.order {
+		t := r.tools[name]
+		if t.ReadOnly() {
+			defs = append(defs, llm.ToolDefinition{
+				Name:        t.Name(),
+				Description: t.Description(),
+				InputSchema: t.Parameters(),
+			})
+		}
+	}
+	return defs
+}
+
+// IsReadOnly 判断指定工具是否只读。未知工具返回 false。
+func (r *Registry) IsReadOnly(name string) bool {
+	t, ok := r.Get(name)
+	return ok && t.ReadOnly()
+}
+
 // Execute 按名查找工具并执行。未知工具兜底为 IsError。
 func (r *Registry) Execute(ctx context.Context, name string, args json.RawMessage) Result {
 	t, ok := r.Get(name)

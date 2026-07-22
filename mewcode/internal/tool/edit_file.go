@@ -18,7 +18,8 @@ type editFileArgs struct {
 // editFileTool 对原文片段做唯一匹配替换
 type editFileTool struct{}
 
-func (t *editFileTool) Name() string { return "edit_file" }
+func (t *editFileTool) Name() string   { return "edit_file" }
+func (t *editFileTool) ReadOnly() bool { return false }
 func (t *editFileTool) Description() string {
 	return "对文件中的原文片段做唯一匹配替换。匹配 0 次或多于 1 次时返回清晰错误，让模型据此重试。"
 }

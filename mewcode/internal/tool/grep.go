@@ -30,7 +30,8 @@ type grepMatch struct {
 	content string
 }
 
-func (t *grepTool) Name() string { return "grep" }
+func (t *grepTool) Name() string   { return "grep" }
+func (t *grepTool) ReadOnly() bool { return true }
 func (t *grepTool) Description() string {
 	return "在文件内容中搜索匹配的文本（RE2 正则），返回 file:line:content 命中列表。"
 }

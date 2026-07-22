@@ -116,7 +116,16 @@ func newAnthropicProvider(cfg config.ProviderConfig) (Provider, error) {
 func (p *anthropicProvider) Name() string  { return p.cfg.Name }
 func (p *anthropicProvider) Model() string { return p.cfg.Model }
 
-func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message, tools []ToolDefinition) <-chan StreamEvent {
+// effectiveSystem 按 suffix 拼接最终 system prompt。空 suffix 时返回单块 SystemPrompt；非空时拼接。
+func effectiveSystem(suffix string) []anthropic.TextBlockParam {
+	text := prompt.SystemPrompt
+	if suffix != "" {
+		text += "\n\n" + suffix
+	}
+	return []anthropic.TextBlockParam{{Text: text}}
+}
+
+func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message, tools []ToolDefinition, systemSuffix string) <-chan StreamEvent {
 	ch := make(chan StreamEvent)
 
 	go func() {
@@ -128,10 +137,8 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message, tools []
 		params := anthropic.MessageNewParams{
 			Model:     anthropic.Model(p.cfg.Model),
 			MaxTokens: 4096,
-			System: []anthropic.TextBlockParam{
-				{Text: prompt.SystemPrompt},
-			},
-			Messages: messages,
+			System:    effectiveSystem(systemSuffix),
+			Messages:  messages,
 		}
 
 		// 注入工具定义
@@ -183,6 +190,15 @@ func (p *anthropicProvider) Stream(ctx context.Context, msgs []Message, tools []
 			case <-ctx.Done():
 			}
 			return
+		}
+
+		// 上抛本轮 token 用量（流结束后 acc.Usage 完整）
+		if acc.Usage.InputTokens > 0 || acc.Usage.OutputTokens > 0 {
+			select {
+			case ch <- StreamEvent{Usage: &Usage{InputTokens: int64(acc.Usage.InputTokens), OutputTokens: int64(acc.Usage.OutputTokens)}}:
+			case <-ctx.Done():
+				return
+			}
 		}
 
 		// 检查是否为工具调用结束

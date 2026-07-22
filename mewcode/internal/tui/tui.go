@@ -53,12 +53,17 @@ type Model struct {
 	conv      *conversation.Conversation
 
 	// 流式状态
-	ctx       context.Context
-	cancel    context.CancelFunc
-	events    <-chan agent.Event
-	curReply  strings.Builder
-	curTool   *toolDisplay
-	turnStart time.Time
+	ctx        context.Context
+	cancel     context.CancelFunc // 程序级取消（idle 时 Ctrl+C 退出）
+	turnCancel context.CancelFunc // 本轮取消（streaming 时 Esc/Ctrl+C）
+	events     <-chan agent.Event
+	curReply   strings.Builder
+	curTools   []toolDisplay // 替换单个 curTool，支持并发批
+	turnStart  time.Time
+	mode       agent.Mode // 当前模式（Normal / Plan），跨轮保持
+	iter       int        // 当前迭代轮次
+	usageIn    int64      // 会话累计输入 token
+	usageOut   int64      // 会话累计输出 token
 
 	width  int
 	height int
@@ -109,6 +114,7 @@ func New(providers []config.ProviderConfig, version string, registry *tool.Regis
 		conv:      &conversation.Conversation{},
 		version:   version,
 		width:     80,
+		mode:      agent.ModeNormal,
 	}
 
 	if len(providers) == 1 {
@@ -150,12 +156,29 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyPressMsg:
-		// Ctrl+C 全局退出
+		// Ctrl+C：streaming 时取消本轮，否则退出程序
 		if msg.String() == "ctrl+c" {
+			if m.state == stateStreaming {
+				if m.turnCancel != nil {
+					m.turnCancel()
+				}
+				return m, waitForEvent(m.events)
+			}
 			if m.cancel != nil {
 				m.cancel()
 			}
 			return m, tea.Quit
+		}
+
+		// Esc：streaming 时取消本轮
+		if msg.Code == tea.KeyEscape {
+			if m.state == stateStreaming {
+				if m.turnCancel != nil {
+					m.turnCancel()
+				}
+				return m, waitForEvent(m.events)
+			}
+			return m, nil
 		}
 
 		switch m.state {
@@ -208,17 +231,33 @@ func (m *Model) handleIdleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// submitMessage 提交用户消息并通过 agent 发起流式请求
+// submitMessage 提交用户消息并通过 agent 发起流式请求。
+// 识别 /plan、/do 特殊命令。
 func (m *Model) submitMessage(text string) (tea.Model, tea.Cmd) {
-	m.conv.AddUser(text)
+	switch {
+	case text == "/plan":
+		m.mode = agent.ModePlan
+		return m, tea.Println(renderNoticeBlock("已进入计划模式（只读工具，产出计划后请用 /do 执行）"))
 
-	m.ctx, m.cancel = context.WithCancel(context.Background())
+	case text == "/do":
+		m.mode = agent.ModeNormal
+		m.conv.AddUser(prompt.ExecuteDirective)
+		// fall through to start streaming
+
+	default:
+		m.conv.AddUser(text)
+	}
+
+	// 启动 per-turn 上下文
+	turnCtx, turnCancel := context.WithCancel(context.Background())
+	m.turnCancel = turnCancel
 
 	a := agent.New(m.provider, m.registry)
-	m.events = a.Run(m.ctx, m.conv)
+	m.events = a.Run(turnCtx, m.conv, m.mode)
 	m.turnStart = time.Now()
 	m.curReply.Reset()
-	m.curTool = nil
+	m.curTools = nil
+	m.iter = 0
 	m.state = stateStreaming
 
 	userBlock := renderUserBlock(text)
@@ -232,55 +271,82 @@ func (m *Model) submitMessage(text string) (tea.Model, tea.Cmd) {
 // handleAgentEvent 处理 agent 事件
 func (m *Model) handleAgentEvent(ev agentEvent) (tea.Model, tea.Cmd) {
 	switch {
-	case ev.Text != "":
-		// 文本增量：累积到 curReply
-		m.curReply.WriteString(ev.Text)
-		return m, waitForEvent(m.events)
+	case ev.Err != nil:
+		errorBlock := renderErrorBlock(ev.Err.Error())
+		return m.finishTurn(), tea.Println(errorBlock)
 
 	case ev.Tool != nil && ev.Tool.Phase == agent.PhaseStart:
-		// 工具开始执行：若有 preamble 文本先提交为 assistant 块
-		m.curTool = &toolDisplay{name: ev.Tool.Name, args: ev.Tool.Args}
-		if m.curReply.Len() > 0 {
+		// 首个工具前先提交 preamble
+		if len(m.curTools) == 0 && m.curReply.Len() > 0 {
 			preamble := m.curReply.String()
 			m.curReply.Reset()
+			preambleCmd := tea.Println(renderAssistantBlock(preamble))
+			m.curTools = append(m.curTools, toolDisplay{name: ev.Tool.Name, args: ev.Tool.Args})
+			return m, tea.Batch(preambleCmd, waitForEvent(m.events))
+		}
+		m.curTools = append(m.curTools, toolDisplay{name: ev.Tool.Name, args: ev.Tool.Args})
+		return m, waitForEvent(m.events)
+
+	case ev.Tool != nil && ev.Tool.Phase == agent.PhaseEnd:
+		// FIFO 弹出队首（agent 保证 start/end 都按调用序发出）
+		if len(m.curTools) > 0 {
+			tool := m.curTools[0]
+			m.curTools = m.curTools[1:]
+			tl := toolLine(tool.name, tool.args)
+			rs := toolResultSummary(ev.Tool.Result, ev.Tool.IsError)
 			return m, tea.Batch(
-				tea.Println(renderAssistantBlock(preamble)),
+				tea.Println(tl),
+				tea.Println(rs),
 				waitForEvent(m.events),
 			)
 		}
 		return m, waitForEvent(m.events)
 
-	case ev.Tool != nil && ev.Tool.Phase == agent.PhaseEnd:
-		// 工具执行结束：提交工具行 + 结果摘要
-		m.curTool = nil
-		tl := toolLine(ev.Tool.Name, ev.Tool.Args)
-		rs := toolResultSummary(ev.Tool.Result, ev.Tool.IsError)
+	case ev.Usage != nil:
+		m.usageIn += ev.Usage.Input
+		m.usageOut += ev.Usage.Output
+		return m, waitForEvent(m.events)
+
+	case ev.Iter > 0:
+		m.iter = ev.Iter
+		return m, waitForEvent(m.events)
+
+	case ev.Notice != "":
 		return m, tea.Batch(
-			tea.Println(tl),
-			tea.Println(rs),
+			tea.Println(renderNoticeBlock(ev.Notice)),
 			waitForEvent(m.events),
 		)
 
-	case ev.Err != nil:
-		errorBlock := renderErrorBlock(ev.Err.Error())
-		m.state = stateIdle
-		m.cancel = nil
-		return m, tea.Println(errorBlock)
+	case ev.Text != "":
+		m.curReply.WriteString(ev.Text)
+		return m, waitForEvent(m.events)
 
 	case ev.Done:
 		// 最终答复
 		fullReply := m.curReply.String()
-		rendered, err := m.renderer.Render(fullReply)
-		if err != nil {
-			rendered = fullReply
+		var cmds []tea.Cmd
+		if fullReply != "" {
+			rendered, err := m.renderer.Render(fullReply)
+			if err != nil {
+				rendered = fullReply
+			}
+			cmds = append(cmds, tea.Println(renderAssistantBlock(rendered)))
 		}
-		replyBlock := renderAssistantBlock(rendered)
-		m.state = stateIdle
-		m.cancel = nil
-		return m, tea.Println(replyBlock)
+		return m.finishTurn(), tea.Batch(cmds...)
 	}
 
 	return m, nil
+}
+
+// finishTurn 清理本轮状态，回空闲态（保留 mode、usage 跨轮）。
+func (m *Model) finishTurn() *Model {
+	m.curReply.Reset()
+	m.curTools = nil
+	m.events = nil
+	m.iter = 0
+	m.turnCancel = nil
+	m.state = stateIdle
+	return m
 }
 
 // handleSpinnerTick 处理 spinner 计时

@@ -7,6 +7,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"mewcode/internal/agent"
 )
 
 var (
@@ -113,18 +114,26 @@ func (m *Model) renderStreamingReply() string {
 
 	var sb strings.Builder
 
-	if m.curTool != nil {
-		// 工具执行中：显示工具行 + Running...
-		line := fmt.Sprintf("● %s(%s)", m.curTool.name, m.curTool.args)
-		sb.WriteString(toolStyle.Render(line))
-		sb.WriteString(" ")
-		sb.WriteString(spinnerStyle.Render(m.spinner.View()))
-		sb.WriteString(" ")
-		sb.WriteString(spinnerStyle.Render("Running…"))
+	if len(m.curTools) > 0 {
+		// 多个工具执行中（并发批）：逐行渲染 ● name(args) Running…
+		for _, tool := range m.curTools {
+			line := fmt.Sprintf("● %s(%s)", tool.name, tool.args)
+			sb.WriteString(toolStyle.Render(line))
+			sb.WriteString(" ")
+			sb.WriteString(spinnerStyle.Render(m.spinner.View()))
+			sb.WriteString(" ")
+			sb.WriteString(spinnerStyle.Render("Running…"))
+			sb.WriteString("\n")
+		}
 	} else {
 		sb.WriteString(spinnerStyle.Render(m.spinner.View()))
 		sb.WriteString(" ")
-		sb.WriteString(spinnerStyle.Render(fmt.Sprintf("Imagining… (%ds)", int(elapsed.Seconds()))))
+		statusLine := fmt.Sprintf("Imagining… (%ds", int(elapsed.Seconds()))
+		if m.iter > 0 {
+			statusLine += fmt.Sprintf(" · 第 %d 轮", m.iter)
+		}
+		statusLine += ")"
+		sb.WriteString(spinnerStyle.Render(statusLine))
 	}
 
 	if text != "" {
@@ -141,7 +150,14 @@ func (m *Model) renderStatusBar() string {
 
 	if m.provider != nil {
 		left = m.provider.Name()
+		if m.mode == agent.ModePlan {
+			left += " PLAN"
+		}
 		right = m.provider.Model()
+		// 累计 token 用量
+		if m.usageIn > 0 || m.usageOut > 0 {
+			right += fmt.Sprintf(" ↑%s ↓%s tok", formatCompact(m.usageIn), formatCompact(m.usageOut))
+		}
 	}
 
 	width := m.width
@@ -157,4 +173,21 @@ func (m *Model) renderStatusBar() string {
 	}
 
 	return leftStyled + strings.Repeat(" ", padding) + rightStyled
+}
+
+// formatCompact 将大整数格式化为紧凑数字（如 1.2k）。
+func formatCompact(n int64) string {
+	switch {
+	case n >= 1000000:
+		return fmt.Sprintf("%.1fM", float64(n)/1000000)
+	case n >= 1000:
+		return fmt.Sprintf("%.1fk", float64(n)/1000)
+	default:
+		return fmt.Sprintf("%d", n)
+	}
+}
+
+// renderNoticeBlock 渲染灰色通知提示块。
+func renderNoticeBlock(text string) string {
+	return statusBarStyle.Render("● " + text)
 }

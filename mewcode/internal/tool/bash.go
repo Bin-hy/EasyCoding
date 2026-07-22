@@ -18,7 +18,8 @@ type bashArgs struct {
 // bashTool 执行 shell 命令，返回 stdout/stderr/退出码
 type bashTool struct{}
 
-func (t *bashTool) Name() string { return "bash" }
+func (t *bashTool) Name() string   { return "bash" }
+func (t *bashTool) ReadOnly() bool { return false }
 func (t *bashTool) Description() string {
 	return "执行 shell 命令，返回标准输出、标准错误与退出码。受超时约束，超时或非零退出以结构化结果返回，不中断会话。"
 }
@@ -64,10 +65,16 @@ func (t *bashTool) Execute(ctx context.Context, args json.RawMessage) Result {
 
 	err := cmd.Run()
 
-	// 检查超时
+	// 检查超时或取消
 	if ctx.Err() != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return Result{
+				Content: "命令执行超时",
+				IsError: true,
+			}
+		}
 		return Result{
-			Content: "命令超时",
+			Content: "命令已被取消",
 			IsError: true,
 		}
 	}

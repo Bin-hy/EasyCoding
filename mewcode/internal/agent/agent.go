@@ -1,4 +1,4 @@
-// Package agent 承载单轮闭环编排：请求#1（带工具）→ 收集工具调用 → 执行 → 结果回灌 → 请求#2（续答）→ 最终文本 → 停。
+// Package agent 承载 ReAct 循环编排：多轮调 LLM → 执行工具 → 结果回灌，直到任务完成。
 // 对外吐出一条 Event 流供 TUI 渲染。只依赖 llm、tool、conversation，不 import SDK，保持协议无关。
 package agent
 
@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	"mewcode/internal/conversation"
 	"mewcode/internal/llm"
+	"mewcode/internal/prompt"
 	"mewcode/internal/tool"
 )
 
@@ -30,15 +32,32 @@ type ToolEvent struct {
 	IsError bool   // PhaseEnd：是否错误
 }
 
-// Event 单轮闭环对外事件流元素，TUI 据非零字段分派渲染。
-type Event struct {
-	Text string     // 文本增量（preamble 或最终答复）
-	Tool *ToolEvent // 工具调用开始/结束
-	Done bool       // 本轮结束
-	Err  error      // 出错（不中断会话）
+// Usage 一轮请求的 token 用量（透传 llm.Usage 语义）。
+type Usage struct {
+	Input  int64 // 本轮输入 token 数
+	Output int64 // 本轮输出 token 数
 }
 
-// Agent 持有 provider 与注册中心，执行单轮闭环。
+// Mode 区分普通模式与计划模式。
+type Mode int
+
+const (
+	ModeNormal Mode = iota
+	ModePlan
+)
+
+// Event 对外事件流元素，TUI 据非零字段分派渲染。
+type Event struct {
+	Text   string     // 模型文本增量（preamble 或最终答复）
+	Tool   *ToolEvent // 工具调用开始/结束
+	Usage  *Usage     // 本轮 token 用量（每轮 stream 结束后一次）
+	Iter   int        // >0：进入第 Iter 轮迭代（进度提示）
+	Notice string     // 系统提示（停止原因等），仅用于 UI 展示，不入对话历史
+	Done   bool       // 本轮（整个 Loop）结束
+	Err    error      // 出错（不中断会话）
+}
+
+// Agent 持有 provider 与注册中心，执行 ReAct 循环。
 type Agent struct {
 	provider llm.Provider
 	registry *tool.Registry
@@ -49,116 +68,364 @@ func New(p llm.Provider, r *tool.Registry) *Agent {
 	return &Agent{provider: p, registry: r}
 }
 
-// Run 执行单轮闭环，返回事件 channel。
-// 算法：
-//  1. 请求#1：收集 preamble 文本和 ToolCalls
-//  2. 无工具 → 文本直接 Done
-//  3. 有工具 → 顺序执行 → 请求#2 续答 → 忽略二轮工具 → Done
-func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation) <-chan Event {
+// 迭代与停止常量（内置，不可配）
+const (
+	maxIterations = 25 // 迭代上限兜底（F2）
+	maxUnknownRun = 3  // 连续「整轮只产生未知工具调用」的迭代数上限（F2）
+)
+
+// 停止/收尾提示文案——既作为 Event{Notice} 推给 UI，也作为 ensureAssistantTail 写入历史的兜底文本。
+const (
+	noticeMaxIter      = "（已达最大迭代轮数 25，自动停止；可继续发消息推进。）"
+	noticeUnknownTools = "（连续多轮只请求到未注册的工具，自动停止。）"
+	noticeStreamErr    = "（请求出错，本轮已中断。）"
+	noticeCancelled    = "（已取消。）"
+)
+
+// Run 执行 ReAct Agent Loop，返回事件 channel；mode 决定工具集与系统后缀。
+func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode Mode) <-chan Event {
 	ch := make(chan Event)
 
 	go func() {
 		defer close(ch)
 
-		defs := a.registry.Definitions()
-
-		// ---- 请求#1 ----
-		preamble, calls, err := streamOnce(ctx, a.provider, conv.Messages(), defs, ch)
-		if err != nil {
-			ch <- Event{Err: err}
-			return
+		// 按 mode 取工具集与系统后缀
+		var defs []llm.ToolDefinition
+		var suffix string
+		if mode == ModePlan {
+			defs = a.registry.ReadOnlyDefinitions()
+			suffix = prompt.PlanModeReminder
+		} else {
+			defs = a.registry.Definitions()
+			suffix = ""
 		}
 
-		// 无工具调用：纯文本回合
-		if len(calls) == 0 {
-			conv.AddAssistant(preamble)
-			ch <- Event{Done: true}
-			return
+		unknownRun := 0
+
+		for iter := 1; iter <= maxIterations; iter++ {
+			// 进度事件（F9）
+			if !emit(ctx, ch, Event{Iter: iter}) {
+				finishCancelled(conv)
+				return
+			}
+
+			// 流式请求本轮
+			text, calls, usage, ok := streamOnce(ctx, a.provider, conv.Messages(), defs, suffix, ch)
+			if !ok && ctx.Err() != nil {
+				// ctx 取消
+				finishCancelled(conv)
+				return
+			}
+			if !ok {
+				// 流出错（Err 已在 streamOnce 内发出）
+				ensureAssistantTail(conv, noticeStreamErr)
+				return
+			}
+
+			// Usage 事件（F8）
+			if usage != nil {
+				emit(ctx, ch, Event{Usage: &Usage{Input: usage.InputTokens, Output: usage.OutputTokens}})
+			}
+
+			// 无工具调用：自然完成（F2-1）
+			if len(calls) == 0 {
+				final := ensureFinal(ch, text)
+				conv.AddAssistant(final)
+				emit(ctx, ch, Event{Done: true})
+				return
+			}
+
+			// 有工具调用：记录 assistant 回合
+			conv.AddAssistantWithToolCalls(text, calls)
+
+			// 统计未知工具
+			if allUnknown(a.registry, calls) {
+				unknownRun++
+			} else {
+				unknownRun = 0
+			}
+
+			// 保序分批并发执行（F5）
+			results, completed := executeBatched(ctx, a.registry, calls, ch)
+
+			// 无论是否取消都回灌工具结果（F6）
+			conv.AddToolResults(results)
+
+			// 执行中被取消——最高优先级终止
+			if !completed {
+				ensureAssistantTail(conv, noticeCancelled)
+				return
+			}
+
+			// 连续未知工具上限（F2-4）
+			if unknownRun >= maxUnknownRun {
+				emit(ctx, ch, Event{Notice: noticeUnknownTools})
+				ensureAssistantTail(conv, noticeUnknownTools)
+				emit(ctx, ch, Event{Done: true})
+				return
+			}
 		}
 
-		// ---- 有工具调用：记录 assistant 回合 ----
-		conv.AddAssistantWithToolCalls(preamble, calls)
-
-		// 顺序执行每个工具
-		var results []llm.ToolResult
-		for _, call := range calls {
-			// 参数预览（取简短串）
-			argsPreview := argPreview(call.Input)
-
-			// 开始
-			ch <- Event{Tool: &ToolEvent{
-				Name:  call.Name,
-				Args:  argsPreview,
-				Phase: PhaseStart,
-			}}
-
-			// 超时执行
-			tctx, cancel := context.WithTimeout(ctx, tool.DefaultTimeout)
-			result := a.registry.Execute(tctx, call.Name, call.Input)
-			cancel()
-
-			// 结果摘要（UI 截断 ~8 行）
-			resultSummary := argPreview(json.RawMessage(result.Content))
-			resultSummary = truncateLines(resultSummary, 8)
-
-			// 结束
-			ch <- Event{Tool: &ToolEvent{
-				Name:    call.Name,
-				Args:    argsPreview,
-				Phase:   PhaseEnd,
-				Result:  resultSummary,
-				IsError: result.IsError,
-			}}
-
-			results = append(results, llm.ToolResult{
-				ToolCallID: call.ID,
-				Content:    result.Content,
-				IsError:    result.IsError,
-			})
-		}
-
-		// 回灌工具结果
-		conv.AddToolResults(results)
-
-		// ---- 请求#2：续答 ----
-		final, _, err := streamOnce(ctx, a.provider, conv.Messages(), defs, ch)
-		if err != nil {
-			ch <- Event{Err: err}
-			return
-		}
-
-		// 空最终答复用占位文本（确保 conversation 中 assistant 回合非空）
-		if final == "" {
-			final = "（单轮工具调用已完成）"
-		}
-		conv.AddAssistant(final)
-		ch <- Event{Done: true}
+		// 触达迭代上限（F2-2）
+		emit(ctx, ch, Event{Notice: noticeMaxIter})
+		ensureAssistantTail(conv, noticeMaxIter)
+		emit(ctx, ch, Event{Done: true})
 	}()
 
 	return ch
 }
 
-// streamOnce 发起一次流式请求，将 Text 增量转发到 ch，返回累积的完整文本和工具调用列表。
-// 出错时返回 error；工具调用列表可能为 nil。
-func streamOnce(ctx context.Context, provider llm.Provider, msgs []llm.Message, tools []llm.ToolDefinition, ch chan<- Event) (string, []llm.ToolCall, error) {
-	var text strings.Builder
-	var toolCalls []llm.ToolCall
+// streamOnce 发起一次流式请求，将 Text 增量转发到 ch，返回累积的完整文本、工具调用列表、本轮用量。
+// 出错时返回 ok=false；ctx 取消也算不 ok。
+func streamOnce(ctx context.Context, provider llm.Provider, msgs []llm.Message, tools []llm.ToolDefinition, suffix string, ch chan<- Event) (text string, calls []llm.ToolCall, usage *llm.Usage, ok bool) {
+	var textBuilder strings.Builder
 
-	stream := provider.Stream(ctx, msgs, tools)
+	stream := provider.Stream(ctx, msgs, tools, suffix)
 	for ev := range stream {
 		switch {
-		case ev.Text != "":
-			text.WriteString(ev.Text)
-			ch <- Event{Text: ev.Text}
-		case len(ev.ToolCalls) > 0:
-			toolCalls = ev.ToolCalls
 		case ev.Err != nil:
-			return text.String(), toolCalls, ev.Err
-		case ev.Done:
-			return text.String(), toolCalls, nil
+			emit(ctx, ch, Event{Err: ev.Err})
+			return textBuilder.String(), calls, nil, false
+		case ev.Usage != nil:
+			usage = ev.Usage
+		case len(ev.ToolCalls) > 0:
+			calls = append(calls, ev.ToolCalls...)
+		case ev.Text != "":
+			textBuilder.WriteString(ev.Text)
+			if !emit(ctx, ch, Event{Text: ev.Text}) {
+				return textBuilder.String(), calls, nil, false
+			}
 		}
 	}
-	return text.String(), toolCalls, nil
+
+	// ctx 取消则算失败
+	if ctx.Err() != nil {
+		return textBuilder.String(), calls, nil, false
+	}
+
+	return textBuilder.String(), calls, usage, true
+}
+
+// executeBatched 保序分批并发执行工具调用（F5）。
+// 返回结果列表和是否全部完成（false 表示执行中被取消）。
+func executeBatched(ctx context.Context, registry *tool.Registry, calls []llm.ToolCall, ch chan<- Event) ([]llm.ToolResult, bool) {
+	results := make([]llm.ToolResult, len(calls))
+	i := 0
+
+	for i < len(calls) {
+		// 取消检查
+		if ctx.Err() != nil {
+			for k := i; k < len(calls); k++ {
+				if results[k].ToolCallID == "" {
+					results[k] = llm.ToolResult{
+						ToolCallID: calls[k].ID,
+						Content:    noticeCancelled,
+						IsError:    true,
+					}
+				}
+			}
+			return results, false
+		}
+
+		if registry.IsReadOnly(calls[i].Name) {
+			// 吃入连续只读区间 [i, j)
+			j := i
+			for j < len(calls) && registry.IsReadOnly(calls[j].Name) {
+				j++
+			}
+
+			// 先按序 emit 所有 Start 事件
+			for k := i; k < j; k++ {
+				argsPreview := argPreview(calls[k].Input)
+				if !emit(ctx, ch, Event{Tool: &ToolEvent{
+					Name:  calls[k].Name,
+					Args:  argsPreview,
+					Phase: PhaseStart,
+				}}) {
+					// ctx 已取消，补齐剩余结果
+					for m := k; m < len(calls); m++ {
+						if results[m].ToolCallID == "" {
+							results[m] = llm.ToolResult{
+								ToolCallID: calls[m].ID,
+								Content:    noticeCancelled,
+								IsError:    true,
+							}
+						}
+					}
+					return results, false
+				}
+			}
+
+			// 并发执行（不发射事件，仅写 results）
+			var wg sync.WaitGroup
+			for k := i; k < j; k++ {
+				wg.Add(1)
+				go func(idx int) {
+					defer wg.Done()
+					tctx, cancel := context.WithTimeout(ctx, tool.DefaultTimeout)
+					defer cancel()
+					r := registry.Execute(tctx, calls[idx].Name, calls[idx].Input)
+					results[idx] = llm.ToolResult{
+						ToolCallID: calls[idx].ID,
+						Content:    r.Content,
+						IsError:    r.IsError,
+					}
+				}(k)
+			}
+			wg.Wait()
+
+			// 再按原始顺序 emit End 事件
+			for k := i; k < j; k++ {
+				result := results[k]
+				argsPreview := argPreview(calls[k].Input)
+				resultSummary := argPreview(json.RawMessage(result.Content))
+				resultSummary = truncateLines(resultSummary, 8)
+				if !emit(ctx, ch, Event{Tool: &ToolEvent{
+					Name:    calls[k].Name,
+					Args:    argsPreview,
+					Phase:   PhaseEnd,
+					Result:  resultSummary,
+					IsError: result.IsError,
+				}}) {
+					// ctx 已取消
+					for m := j; m < len(calls); m++ {
+						if results[m].ToolCallID == "" {
+							results[m] = llm.ToolResult{
+								ToolCallID: calls[m].ID,
+								Content:    noticeCancelled,
+								IsError:    true,
+							}
+						}
+					}
+					return results, false
+				}
+			}
+			i = j
+		} else {
+			// 串行执行单个有副作用工具
+			call := calls[i]
+			argsPreview := argPreview(call.Input)
+
+			// Start 事件
+			if !emit(ctx, ch, Event{Tool: &ToolEvent{
+				Name:  call.Name,
+				Args:  argsPreview,
+				Phase: PhaseStart,
+			}}) {
+				for m := i; m < len(calls); m++ {
+					if results[m].ToolCallID == "" {
+						results[m] = llm.ToolResult{
+							ToolCallID: calls[m].ID,
+							Content:    noticeCancelled,
+							IsError:    true,
+						}
+					}
+				}
+				return results, false
+			}
+
+			tctx, cancel := context.WithTimeout(ctx, tool.DefaultTimeout)
+			result := registry.Execute(tctx, call.Name, call.Input)
+			cancel()
+
+			results[i] = llm.ToolResult{
+				ToolCallID: call.ID,
+				Content:    result.Content,
+				IsError:    result.IsError,
+			}
+
+			// End 事件
+			resultSummary := argPreview(json.RawMessage(result.Content))
+			resultSummary = truncateLines(resultSummary, 8)
+			if !emit(ctx, ch, Event{Tool: &ToolEvent{
+				Name:    call.Name,
+				Args:    argsPreview,
+				Phase:   PhaseEnd,
+				Result:  resultSummary,
+				IsError: result.IsError,
+			}}) {
+				for m := i + 1; m < len(calls); m++ {
+					if results[m].ToolCallID == "" {
+						results[m] = llm.ToolResult{
+							ToolCallID: calls[m].ID,
+							Content:    noticeCancelled,
+							IsError:    true,
+						}
+					}
+				}
+				return results, false
+			}
+			i++
+		}
+	}
+
+	// 即使所有工具执行完成，若 ctx 已取消则报 incomplete
+	if ctx.Err() != nil {
+		for k := i; k < len(calls); k++ {
+			if results[k].ToolCallID == "" {
+				results[k] = llm.ToolResult{
+					ToolCallID: calls[k].ID,
+					Content:    noticeCancelled,
+					IsError:    true,
+				}
+			}
+		}
+		return results, false
+	}
+
+	return results, true
+}
+
+// emit 尝试向 ch 发送事件，返回 true。若 ctx 已取消则返回 false。
+func emit(ctx context.Context, ch chan<- Event, e Event) bool {
+	select {
+	case ch <- e:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// allUnknown 判断所有调用是否都请求了注册中心不存在的工具。空列表返回 false。
+func allUnknown(registry *tool.Registry, calls []llm.ToolCall) bool {
+	if len(calls) == 0 {
+		return false
+	}
+	for _, c := range calls {
+		if _, ok := registry.Get(c.Name); ok {
+			return false
+		}
+	}
+	return true
+}
+
+// ensureFinal 确保最终文本非空；为空时返回占位文本（避免空 assistant 回合破坏下一轮请求）。
+// ensureFinal 确保最终文本非空；为空时返回占位文本（避免空 assistant 回合破坏下一轮请求）。
+// 此处不阻塞发送——Run 已收到无工具调用的纯文本，channel 必然在消费中。
+func ensureFinal(ch chan<- Event, text string) string {
+	if text != "" {
+		return text
+	}
+	placeholder := "（任务已完成）"
+	// 不使用 ctx 阻塞发送（仅在最终文本为空时触发，channel 必然在消费中）
+	select {
+	case ch <- Event{Text: placeholder}:
+	default:
+	}
+	return placeholder
+}
+
+// ensureAssistantTail 若历史末尾不是 assistant 角色，补一条兜底文本。
+// 确保取消/出错/上限后角色仍交替，下一轮请求不报 400（F6）。
+func ensureAssistantTail(conv *conversation.Conversation, fallback string) {
+	if conv.LastRole() != llm.RoleAssistant {
+		conv.AddAssistant(fallback)
+	}
+}
+
+// finishCancelled 取消路径统一收尾。
+func finishCancelled(conv *conversation.Conversation) {
+	ensureAssistantTail(conv, noticeCancelled)
 }
 
 // argPreview 从 JSON 参数中提取关键字段做简短预览。

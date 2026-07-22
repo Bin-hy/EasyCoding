@@ -16,11 +16,12 @@ type Result struct {
 }
 
 // Tool 统一工具抽象（F1）。
-// 每个工具暴露名称、给模型看的描述、参数 Schema、执行入口。
+// 每个工具暴露名称、给模型看的描述、参数 Schema、执行入口、只读标记。
 type Tool interface {
 	Name() string               // 模型看到的工具名，如 "read_file"
 	Description() string        // 给模型的用途说明
 	Parameters() map[string]any // 手写 JSON Schema（type/properties/required/description）
+	ReadOnly() bool             // true=只读工具（可并发执行 & Plan Mode 放行）
 	Execute(ctx context.Context, args json.RawMessage) Result
 }
 

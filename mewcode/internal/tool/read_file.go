@@ -16,7 +16,8 @@ type readFileArgs struct {
 // readFileTool 读取文件内容，返回带行号的文本
 type readFileTool struct{}
 
-func (t *readFileTool) Name() string { return "read_file" }
+func (t *readFileTool) Name() string   { return "read_file" }
+func (t *readFileTool) ReadOnly() bool { return true }
 func (t *readFileTool) Description() string {
 	return "读取指定文件的内容，返回带行号的文本。文件不存在或不可读时返回结构化错误。"
 }

@@ -19,7 +19,8 @@ type globArgs struct {
 // globTool 按 glob 模式查找匹配文件
 type globTool struct{}
 
-func (t *globTool) Name() string { return "glob" }
+func (t *globTool) Name() string   { return "glob" }
+func (t *globTool) ReadOnly() bool { return true }
 func (t *globTool) Description() string {
 	return "按 glob 模式查找匹配文件，返回匹配的文件路径列表。支持 ** 跨任意层级目录。"
 }

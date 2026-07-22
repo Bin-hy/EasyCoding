@@ -37,3 +37,30 @@ func TestConversation_Empty(t *testing.T) {
 		t.Errorf("空对话期望 0 条消息，实际 %d", len(msgs))
 	}
 }
+
+func TestConversation_LastRole(t *testing.T) {
+	c := &Conversation{}
+
+	// 空历史返回 ""
+	if r := c.LastRole(); r != "" {
+		t.Errorf("空历史期望 \"\"，实际 %q", r)
+	}
+
+	// AddUser 后返回 "user"
+	c.AddUser("hello")
+	if r := c.LastRole(); r != "user" {
+		t.Errorf("AddUser 后期望 user，实际 %q", r)
+	}
+
+	// AddAssistant 后返回 "assistant"
+	c.AddAssistant("hi")
+	if r := c.LastRole(); r != "assistant" {
+		t.Errorf("AddAssistant 后期望 assistant，实际 %q", r)
+	}
+
+	// AddToolResults 后返回 "tool"
+	c.AddToolResults(nil)
+	if r := c.LastRole(); r != "tool" {
+		t.Errorf("AddToolResults 后期望 tool，实际 %q", r)
+	}
+}
