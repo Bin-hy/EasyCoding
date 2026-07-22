@@ -1,0 +1,35 @@
+# MewCode 权限配置文件示例
+# 复制为 settings.yaml（项目级）或 settings.local.yaml（本地级，gitignore 保护）
+#
+# 三层配置文件（优先级：本地 > 项目 > 用户）：
+#   ~/.mewcode/settings.yaml          — 用户级（全局生效）
+#   <项目>/.mewcode/settings.yaml     — 项目级（团队共享，可提交 git）
+#   <项目>/.mewcode/settings.local.yaml — 本地级（个人偏好，gitignore）
+#
+# 规则格式：工具名（友好名）+ 可选模式段
+#   友好名：Bash / Read / Write / Edit / Glob / Grep
+#   精确匹配：Bash(git status)      — 仅放行 git status
+#   Glob 匹配：Bash(git *)          — 放行所有 git 子命令
+#   路径匹配：Write(src/**)         — 放行 src/ 下任意文件写入
+#   全匹配：  Bash                  — 放行该工具的全部调用
+#
+# 注意：只读类工具（Read/Glob/Grep）默认即 Allow；
+#  deny 规则可对只读做围栏，如 Read(.env) deny 禁止读取 .env 文件。
+
+# 启动默认权限模式（可选：default / acceptEdits / plan / bypassPermissions）
+# 不配置则默认为 default
+defaultMode: default
+
+permissions:
+  # 放行规则：提前放行特定命令/路径，不再经过模式兜底（不弹窗确认）
+  allow:
+    - "Bash(git *)"             # 所有 git 命令自动放行
+    - "Bash(go test ./...)"     # 运行测试自动放行
+    - "Bash(go build ./...)"    # 编译自动放行
+
+  # 拒绝规则：显式拦截（优先级高于 allow）
+  deny:
+    - "Bash(rm *)"              # 禁止任何 rm 命令
+    - "Read(.env)"              # 禁止读取 .env 文件
+    - "Write(.env)"             # 禁止写入 .env 文件
+    - "Bash(curl *)"            # 禁止 curl 出网

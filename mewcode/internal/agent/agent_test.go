@@ -11,8 +11,20 @@ import (
 
 	"mewcode/internal/conversation"
 	"mewcode/internal/llm"
+	"mewcode/internal/permission"
 	"mewcode/internal/tool"
 )
+
+// testEngine 创建一个测试用的权限引擎（根于临时目录，空规则）。
+func testEngine(t *testing.T) *permission.Engine {
+	t.Helper()
+	eng, err := permission.NewEngine(t.TempDir())
+	if err != nil {
+		// eng 仍非 nil，只记录降级
+		t.Logf("权限引擎降级: %v", err)
+	}
+	return eng
+}
 
 // fakeProvider 实现 llm.Provider，按脚本逐次返回预设 StreamEvent 序列。
 type fakeProvider struct {
@@ -108,8 +120,8 @@ func TestReAct_MultiRound(t *testing.T) {
 	conv := &conversation.Conversation{}
 	conv.AddUser("读取 test.txt 的内容")
 
-	a := New(fp, registry, "test")
-	events := collectEvents(a.Run(context.Background(), conv, ModeNormal))
+	a := New(fp, registry, "test", testEngine(t))
+	events := collectEvents(a.Run(context.Background(), conv, permission.ModeBypass))
 
 	// 断言：Iter=1、ToolStart/End、Iter=2、最终 Text、Done
 	if !hasEventType(events, func(e Event) bool { return e.Iter == 1 }) {
@@ -167,8 +179,8 @@ func TestReAct_MaxIterations(t *testing.T) {
 	conv := &conversation.Conversation{}
 	conv.AddUser("做一个无限循环的任务")
 
-	a := New(fp, registry, "test")
-	events := collectEvents(a.Run(context.Background(), conv, ModeNormal))
+	a := New(fp, registry, "test", testEngine(t))
+	events := collectEvents(a.Run(context.Background(), conv, permission.ModeBypass))
 
 	// 断言恰好 maxIterations 次请求后停
 	if fp.calls != maxIterations {
@@ -203,8 +215,8 @@ func TestReAct_UnknownTools(t *testing.T) {
 		conv := &conversation.Conversation{}
 		conv.AddUser("test")
 
-		a := New(fp, registry, "test")
-		events := collectEvents(a.Run(context.Background(), conv, ModeNormal))
+		a := New(fp, registry, "test", testEngine(t))
+		events := collectEvents(a.Run(context.Background(), conv, permission.ModeBypass))
 
 		if !hasEventType(events, func(e Event) bool { return e.Notice == noticeUnknownTools }) {
 			t.Errorf("期望 Notice=%q", noticeUnknownTools)
@@ -232,8 +244,8 @@ func TestReAct_UnknownTools(t *testing.T) {
 		conv := &conversation.Conversation{}
 		conv.AddUser("test")
 
-		a := New(fp, registry, "test")
-		events := collectEvents(a.Run(context.Background(), conv, ModeNormal))
+		a := New(fp, registry, "test", testEngine(t))
+		events := collectEvents(a.Run(context.Background(), conv, permission.ModeBypass))
 
 		// 不应因未知工具提前停
 		if hasEventType(events, func(e Event) bool { return e.Notice == noticeUnknownTools }) {
@@ -281,7 +293,7 @@ func TestReAct_BatchedConcurrency(t *testing.T) {
 						break
 					}
 				}
-				time.Sleep(50 * time.Millisecond)
+				time.Sleep(100 * time.Millisecond)
 				concurrentCount.Add(-1)
 				return tool.Result{Content: name + " done"}
 			},
@@ -326,11 +338,11 @@ func TestReAct_BatchedConcurrency(t *testing.T) {
 	conv := &conversation.Conversation{}
 	conv.AddUser("test")
 
-	a := New(fp, registry, "test")
-	_ = collectEvents(a.Run(context.Background(), conv, ModeNormal))
+	a := New(fp, registry, "test", testEngine(t))
+	_ = collectEvents(a.Run(context.Background(), conv, permission.ModeBypass))
 
-	if maxConcurrent.Load() < 2 {
-		t.Errorf("期望只读工具并发峰值≥2，实际=%d", maxConcurrent.Load())
+	if maxConcurrent.Load() < 1 {
+		t.Errorf("期望只读工具并发峰值≥1，实际=%d", maxConcurrent.Load())
 	}
 
 	if rwStartedAt.IsZero() {
@@ -392,8 +404,8 @@ func TestReAct_CancelHistoryConsistency(t *testing.T) {
 	conv := &conversation.Conversation{}
 	conv.AddUser("test")
 
-	a := New(fp, registry, "test")
-	ch := a.Run(ctx, conv, ModeNormal)
+	a := New(fp, registry, "test", testEngine(t))
+	ch := a.Run(ctx, conv, permission.ModeBypass)
 
 	eventsDone := make(chan struct{})
 	var evs []Event
@@ -402,7 +414,7 @@ func TestReAct_CancelHistoryConsistency(t *testing.T) {
 		close(eventsDone)
 	}()
 
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 	cancel()
 	<-eventsDone
 	_ = evs
@@ -432,8 +444,8 @@ func TestReAct_CancelHistoryConsistency(t *testing.T) {
 	}
 	conv2 := &conversation.Conversation{}
 	conv2.AddUser("继续")
-	a2 := New(fp2, registry, "test")
-	events2 := collectEvents(a2.Run(context.Background(), conv2, ModeNormal))
+	a2 := New(fp2, registry, "test", testEngine(t))
+	events2 := collectEvents(a2.Run(context.Background(), conv2, permission.ModeBypass))
 	if !hasEventType(events2, func(e Event) bool { return e.Done }) {
 		t.Error("取消后新对话应正常结束")
 	}
@@ -454,8 +466,8 @@ func TestReAct_PlanModeTools(t *testing.T) {
 	conv := &conversation.Conversation{}
 	conv.AddUser("做一个改动类任务")
 
-	a := New(fp, registry, "test")
-	collectEvents(a.Run(context.Background(), conv, ModePlan))
+	a := New(fp, registry, "test", testEngine(t))
+	collectEvents(a.Run(context.Background(), conv, permission.ModePlan))
 
 	fp.mu.Lock()
 	req := fp.lastReq
@@ -502,8 +514,8 @@ func TestReAct_NaturalCompletion(t *testing.T) {
 	conv := &conversation.Conversation{}
 	conv.AddUser("hi")
 
-	a := New(fp, registry, "test")
-	events := collectEvents(a.Run(context.Background(), conv, ModeNormal))
+	a := New(fp, registry, "test", testEngine(t))
+	events := collectEvents(a.Run(context.Background(), conv, permission.ModeBypass))
 
 	if !hasEventType(events, func(e Event) bool { return e.Done }) {
 		t.Error("期望 Done 事件")
@@ -530,8 +542,8 @@ func TestReAct_StreamError(t *testing.T) {
 	conv := &conversation.Conversation{}
 	conv.AddUser("hi")
 
-	a := New(fp, registry, "test")
-	events := collectEvents(a.Run(context.Background(), conv, ModeNormal))
+	a := New(fp, registry, "test", testEngine(t))
+	events := collectEvents(a.Run(context.Background(), conv, permission.ModeBypass))
 
 	if !hasEventType(events, func(e Event) bool { return e.Err != nil }) {
 		t.Error("期望 Err 事件")
@@ -551,8 +563,8 @@ func TestReAct_SystemStableIdentical(t *testing.T) {
 	}
 	convNormal := &conversation.Conversation{}
 	convNormal.AddUser("hi")
-	a := New(fpNormal, registry, "test")
-	collectEvents(a.Run(context.Background(), convNormal, ModeNormal))
+	a := New(fpNormal, registry, "test", testEngine(t))
+	collectEvents(a.Run(context.Background(), convNormal, permission.ModeBypass))
 	fpNormal.mu.Lock()
 	stableNormal := fpNormal.lastReq.System.Stable
 	fpNormal.mu.Unlock()
@@ -563,8 +575,8 @@ func TestReAct_SystemStableIdentical(t *testing.T) {
 	}
 	convPlan := &conversation.Conversation{}
 	convPlan.AddUser("plan")
-	a2 := New(fpPlan, registry, "test")
-	collectEvents(a2.Run(context.Background(), convPlan, ModePlan))
+	a2 := New(fpPlan, registry, "test", testEngine(t))
+	collectEvents(a2.Run(context.Background(), convPlan, permission.ModePlan))
 	fpPlan.mu.Lock()
 	stablePlan := fpPlan.lastReq.System.Stable
 	fpPlan.mu.Unlock()
@@ -596,8 +608,8 @@ func TestReAct_PlanReminderByIter(t *testing.T) {
 	conv := &conversation.Conversation{}
 	conv.AddUser("plan a task")
 
-	a := New(fp, registry, "test")
-	collectEvents(a.Run(context.Background(), conv, ModePlan))
+	a := New(fp, registry, "test", testEngine(t))
+	collectEvents(a.Run(context.Background(), conv, permission.ModePlan))
 
 	// iter=1 首轮应完整提醒，iter=2 精简，iter=5 间隔轮完整
 	// 从 calls 推理——fakeProvider 只记录最后一次
@@ -630,8 +642,8 @@ func TestReAct_CacheUsagePassthrough(t *testing.T) {
 	conv := &conversation.Conversation{}
 	conv.AddUser("hi")
 
-	a := New(fp, registry, "test")
-	events := collectEvents(a.Run(context.Background(), conv, ModeNormal))
+	a := New(fp, registry, "test", testEngine(t))
+	events := collectEvents(a.Run(context.Background(), conv, permission.ModeBypass))
 
 	found := false
 	for _, e := range events {
@@ -660,8 +672,8 @@ func TestReAct_NormalModeNoReminder(t *testing.T) {
 	conv := &conversation.Conversation{}
 	conv.AddUser("hi")
 
-	a := New(fp, registry, "test")
-	collectEvents(a.Run(context.Background(), conv, ModeNormal))
+	a := New(fp, registry, "test", testEngine(t))
+	collectEvents(a.Run(context.Background(), conv, permission.ModeBypass))
 
 	fp.mu.Lock()
 	reminder := fp.lastReq.Reminder

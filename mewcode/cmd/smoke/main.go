@@ -11,6 +11,7 @@ import (
 	"mewcode/internal/config"
 	"mewcode/internal/conversation"
 	"mewcode/internal/llm"
+	"mewcode/internal/permission"
 	"mewcode/internal/tool"
 )
 
@@ -35,15 +36,19 @@ func main() {
 	reg := tool.NewDefaultRegistry()
 	conv := &conversation.Conversation{}
 
+	// 构造权限引擎（非交互式，以 ModeBypass 运行）
+	cwd, _ := os.Getwd()
+	eng, _ := permission.NewEngine(cwd)
+
 	// 场景1：多轮工具调用（含缓存用量打印）
 	fmt.Println("=== 场景1: 多轮工具调用 ===")
 	ctx := context.Background()
-	a := agent.New(p, reg, "dev")
+	a := agent.New(p, reg, "dev", eng)
 
 	conv.AddUser("帮我读 docs/ch03/spec.md 文件，用一句话总结它说了什么")
 
 	iter := 0
-	for ev := range a.Run(ctx, conv, agent.ModeNormal) {
+	for ev := range a.Run(ctx, conv, permission.ModeBypass) {
 		switch {
 		case ev.Text != "":
 			fmt.Print(ev.Text)
@@ -78,7 +83,7 @@ func main() {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for ev := range a.Run(cancelCtx, conv2, agent.ModeNormal) {
+		for ev := range a.Run(cancelCtx, conv2, permission.ModeBypass) {
 			if ev.Tool != nil && ev.Tool.Phase == agent.PhaseStart {
 				cancel() // 工具开始时立即取消
 			}
@@ -99,7 +104,7 @@ func main() {
 	// 继续对话验证不报错
 	conv2.AddUser("继续")
 	fmt.Println("继续对话（验证无 400 错误）...")
-	for ev := range a.Run(ctx, conv2, agent.ModeNormal) {
+	for ev := range a.Run(ctx, conv2, permission.ModeBypass) {
 		switch {
 		case ev.Err != nil:
 			fmt.Printf("[error] %v\n", ev.Err)

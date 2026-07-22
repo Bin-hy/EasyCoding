@@ -1,5 +1,5 @@
-// Package agent 承载 ReAct 循环编排：多轮调 LLM → 执行工具 → 结果回灌，直到任务完成。
-// 对外吐出一条 Event 流供 TUI 渲染。只依赖 llm、tool、conversation，不 import SDK，保持协议无关。
+// Package agent 承载 ReAct 循环编排：多轮调 LLM → 权限判定 → 执行工具 → 结果回灌，直到任务完成。
+// 对外吐出一条 Event 流供 TUI 渲染。只依赖 llm、tool、conversation、permission，不 import SDK，保持协议无关。
 package agent
 
 import (
@@ -11,6 +11,7 @@ import (
 
 	"mewcode/internal/conversation"
 	"mewcode/internal/llm"
+	"mewcode/internal/permission"
 	"mewcode/internal/prompt"
 	"mewcode/internal/tool"
 )
@@ -40,35 +41,37 @@ type Usage struct {
 	CacheRead  int64 // 缓存读取 token（命中复用）
 }
 
-// Mode 区分普通模式与计划模式。
-type Mode int
-
-const (
-	ModeNormal Mode = iota
-	ModePlan
-)
+// ApprovalRequest 人在回路待批准请求（F8）。
+type ApprovalRequest struct {
+	Name    string                  // 工具内部名（用于展示 ● name(args)）
+	Args    string                  // 参数预览
+	Reason  string                  // 触发 Ask 的原因（模式 + 类别）
+	Respond chan permission.Outcome // 缓冲=1：TUI 回传用户选择，agent 单次接收
+}
 
 // Event 对外事件流元素，TUI 据非零字段分派渲染。
 type Event struct {
-	Text   string     // 模型文本增量（preamble 或最终答复）
-	Tool   *ToolEvent // 工具调用开始/结束
-	Usage  *Usage     // 本轮 token 用量（每轮 stream 结束后一次）
-	Iter   int        // >0：进入第 Iter 轮迭代（进度提示）
-	Notice string     // 系统提示（停止原因等），仅用于 UI 展示，不入对话历史
-	Done   bool       // 本轮（整个 Loop）结束
-	Err    error      // 出错（不中断会话）
+	Text     string           // 模型文本增量（preamble 或最终答复）
+	Tool     *ToolEvent       // 工具调用开始/结束
+	Usage    *Usage           // 本轮 token 用量（每轮 stream 结束后一次）
+	Iter     int              // >0：进入第 Iter 轮迭代（进度提示）
+	Notice   string           // 系统提示（停止原因等），仅用于 UI 展示，不入对话历史
+	Done     bool             // 本轮（整个 Loop）结束
+	Err      error            // 出错（不中断会话）
+	Approval *ApprovalRequest // 非空：请求人在回路批准，消费者须回传 Respond 后再续读事件
 }
 
-// Agent 持有 provider 与注册中心，执行 ReAct 循环。
+// Agent 持有 provider、注册中心与权限引擎，执行 ReAct 循环。
 type Agent struct {
 	provider llm.Provider
 	registry *tool.Registry
-	version  string // 应用版本，供环境段采集
+	version  string             // 应用版本，供环境段采集
+	eng      *permission.Engine // 权限引擎（前四层判定 + 配置）
 }
 
 // New 创建 Agent。
-func New(p llm.Provider, r *tool.Registry, version string) *Agent {
-	return &Agent{provider: p, registry: r, version: version}
+func New(p llm.Provider, r *tool.Registry, version string, eng *permission.Engine) *Agent {
+	return &Agent{provider: p, registry: r, version: version, eng: eng}
 }
 
 // 迭代与停止常量（内置，不可配）
@@ -87,7 +90,7 @@ const (
 )
 
 // Run 执行 ReAct Agent Loop，返回事件 channel；mode 决定工具集与系统后缀。
-func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode Mode) <-chan Event {
+func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode permission.Mode) <-chan Event {
 	ch := make(chan Event)
 
 	go func() {
@@ -99,7 +102,7 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode M
 
 		// 按 mode 取工具集
 		var defs []llm.ToolDefinition
-		if mode == ModePlan {
+		if mode == permission.ModePlan {
 			defs = a.registry.ReadOnlyDefinitions()
 		} else {
 			defs = a.registry.Definitions()
@@ -117,7 +120,7 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode M
 
 			// 按轮次计算规划模式 reminder
 			var reminder string
-			if mode == ModePlan {
+			if mode == permission.ModePlan {
 				full := iter == 1 || (iter-1)%planReminderInterval == 0
 				reminder = prompt.PlanReminder(full)
 			}
@@ -163,8 +166,8 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode M
 				unknownRun = 0
 			}
 
-			// 保序分批并发执行（F5）
-			results, completed := executeBatched(ctx, a.registry, calls, ch)
+			// 保序分批并发执行（F5），含权限判定
+			results, completed := a.executeBatched(ctx, calls, mode, ch)
 
 			// 无论是否取消都回灌工具结果（F6）
 			conv.AddToolResults(results)
@@ -231,9 +234,9 @@ func streamOnce(ctx context.Context, provider llm.Provider, msgs []llm.Message, 
 	return textBuilder.String(), calls, usage, true
 }
 
-// executeBatched 保序分批并发执行工具调用（F5）。
+// executeBatched 保序分批并发执行工具调用（F5），含权限判定（F6）。
 // 返回结果列表和是否全部完成（false 表示执行中被取消）。
-func executeBatched(ctx context.Context, registry *tool.Registry, calls []llm.ToolCall, ch chan<- Event) ([]llm.ToolResult, bool) {
+func (a *Agent) executeBatched(ctx context.Context, calls []llm.ToolCall, mode permission.Mode, ch chan<- Event) ([]llm.ToolResult, bool) {
 	results := make([]llm.ToolResult, len(calls))
 	i := 0
 
@@ -252,11 +255,21 @@ func executeBatched(ctx context.Context, registry *tool.Registry, calls []llm.To
 			return results, false
 		}
 
-		if registry.IsReadOnly(calls[i].Name) {
+		if a.registry.IsReadOnly(calls[i].Name) {
 			// 吃入连续只读区间 [i, j)
 			j := i
-			for j < len(calls) && registry.IsReadOnly(calls[j].Name) {
+			for j < len(calls) && a.registry.IsReadOnly(calls[j].Name) {
 				j++
+			}
+
+			// 权限检查：逐个 Check，标记被拒项
+			preDenied := make(map[int]string) // idx → deny reason
+			for k := i; k < j; k++ {
+				d, reason := a.eng.Check(mode, calls[k], true)
+				if d == permission.Deny {
+					preDenied[k] = reason
+				}
+				// 只读永不 Ask（N3），无需处理 Ask 分支
 			}
 
 			// 先按序 emit 所有 Start 事件
@@ -281,15 +294,29 @@ func executeBatched(ctx context.Context, registry *tool.Registry, calls []llm.To
 				}
 			}
 
-			// 并发执行（不发射事件，仅写 results）
+			// 被拒项预先写结果，不纳入并发执行
+			for k := i; k < j; k++ {
+				if reason, denied := preDenied[k]; denied {
+					results[k] = llm.ToolResult{
+						ToolCallID: calls[k].ID,
+						Content:    reason,
+						IsError:    true,
+					}
+				}
+			}
+
+			// 并发执行未被拒的只读工具
 			var wg sync.WaitGroup
 			for k := i; k < j; k++ {
+				if _, denied := preDenied[k]; denied {
+					continue // 跳过被拒项
+				}
 				wg.Add(1)
 				go func(idx int) {
 					defer wg.Done()
 					tctx, cancel := context.WithTimeout(ctx, tool.DefaultTimeout)
 					defer cancel()
-					r := registry.Execute(tctx, calls[idx].Name, calls[idx].Input)
+					r := a.registry.Execute(tctx, calls[idx].Name, calls[idx].Input)
 					results[idx] = llm.ToolResult{
 						ToolCallID: calls[idx].ID,
 						Content:    r.Content,
@@ -299,7 +326,7 @@ func executeBatched(ctx context.Context, registry *tool.Registry, calls []llm.To
 			}
 			wg.Wait()
 
-			// 再按原始顺序 emit End 事件
+			// 再按原始顺序 emit End 事件（含被拒项）
 			for k := i; k < j; k++ {
 				result := results[k]
 				argsPreview := argPreview(calls[k].Input)
@@ -327,60 +354,199 @@ func executeBatched(ctx context.Context, registry *tool.Registry, calls []llm.To
 			}
 			i = j
 		} else {
-			// 串行执行单个有副作用工具
+			// 串行执行单个有副作用工具（含权限判定 + 人在回路）
 			call := calls[i]
 			argsPreview := argPreview(call.Input)
 
-			// Start 事件
-			if !emit(ctx, ch, Event{Tool: &ToolEvent{
-				Name:  call.Name,
-				Args:  argsPreview,
-				Phase: PhaseStart,
-			}}) {
-				for m := i; m < len(calls); m++ {
-					if results[m].ToolCallID == "" {
-						results[m] = llm.ToolResult{
-							ToolCallID: calls[m].ID,
-							Content:    noticeCancelled,
-							IsError:    true,
+			// 前四层判定
+			d, reason := a.eng.Check(mode, call, false)
+
+			switch d {
+			case permission.Deny:
+				// Start + End 事件（错误）
+				if !emit(ctx, ch, Event{Tool: &ToolEvent{
+					Name:  call.Name,
+					Args:  argsPreview,
+					Phase: PhaseStart,
+				}}) {
+					for m := i; m < len(calls); m++ {
+						if results[m].ToolCallID == "" {
+							results[m] = llm.ToolResult{
+								ToolCallID: calls[m].ID,
+								Content:    noticeCancelled,
+								IsError:    true,
+							}
 						}
 					}
+					return results, false
 				}
-				return results, false
-			}
 
-			tctx, cancel := context.WithTimeout(ctx, tool.DefaultTimeout)
-			result := registry.Execute(tctx, call.Name, call.Input)
-			cancel()
+				results[i] = llm.ToolResult{
+					ToolCallID: call.ID,
+					Content:    reason,
+					IsError:    true,
+				}
 
-			results[i] = llm.ToolResult{
-				ToolCallID: call.ID,
-				Content:    result.Content,
-				IsError:    result.IsError,
-			}
-
-			// End 事件
-			resultSummary := argPreview(json.RawMessage(result.Content))
-			resultSummary = truncateLines(resultSummary, 8)
-			if !emit(ctx, ch, Event{Tool: &ToolEvent{
-				Name:    call.Name,
-				Args:    argsPreview,
-				Phase:   PhaseEnd,
-				Result:  resultSummary,
-				IsError: result.IsError,
-			}}) {
-				for m := i + 1; m < len(calls); m++ {
-					if results[m].ToolCallID == "" {
-						results[m] = llm.ToolResult{
-							ToolCallID: calls[m].ID,
-							Content:    noticeCancelled,
-							IsError:    true,
+				if !emit(ctx, ch, Event{Tool: &ToolEvent{
+					Name:    call.Name,
+					Args:    argsPreview,
+					Phase:   PhaseEnd,
+					Result:  reason,
+					IsError: true,
+				}}) {
+					for m := i + 1; m < len(calls); m++ {
+						if results[m].ToolCallID == "" {
+							results[m] = llm.ToolResult{
+								ToolCallID: calls[m].ID,
+								Content:    noticeCancelled,
+								IsError:    true,
+							}
 						}
 					}
+					return results, false
 				}
-				return results, false
+				i++
+
+			case permission.Ask:
+				// 第五层：人在回路
+				outcome, ok2 := a.requestApproval(ctx, call, reason, ch)
+				if !ok2 {
+					// ctx 取消
+					for m := i; m < len(calls); m++ {
+						if results[m].ToolCallID == "" {
+							results[m] = llm.ToolResult{
+								ToolCallID: calls[m].ID,
+								Content:    noticeCancelled,
+								IsError:    true,
+							}
+						}
+					}
+					return results, false
+				}
+
+				switch outcome {
+				case permission.OutcomeDenyOnce:
+					results[i] = llm.ToolResult{
+						ToolCallID: call.ID,
+						Content:    "用户拒绝执行：" + reason,
+						IsError:    true,
+					}
+
+				case permission.OutcomeAllowOnce, permission.OutcomeAllowForever:
+					if outcome == permission.OutcomeAllowForever {
+						// 永久放行：写本地配置
+						if err := a.eng.PersistLocalAllow(call); err != nil {
+							// 仅记录，不阻断执行
+							emit(ctx, ch, Event{Notice: fmt.Sprintf("（写入本地规则失败: %v）", err)})
+						}
+					}
+
+					// 执行工具
+					// Start 事件
+					if !emit(ctx, ch, Event{Tool: &ToolEvent{
+						Name:  call.Name,
+						Args:  argsPreview,
+						Phase: PhaseStart,
+					}}) {
+						for m := i; m < len(calls); m++ {
+							if results[m].ToolCallID == "" {
+								results[m] = llm.ToolResult{
+									ToolCallID: calls[m].ID,
+									Content:    noticeCancelled,
+									IsError:    true,
+								}
+							}
+						}
+						return results, false
+					}
+
+					tctx, cancel := context.WithTimeout(ctx, tool.DefaultTimeout)
+					result := a.registry.Execute(tctx, call.Name, call.Input)
+					cancel()
+
+					results[i] = llm.ToolResult{
+						ToolCallID: call.ID,
+						Content:    result.Content,
+						IsError:    result.IsError,
+					}
+
+					// End 事件
+					resultSummary := argPreview(json.RawMessage(result.Content))
+					resultSummary = truncateLines(resultSummary, 8)
+					if !emit(ctx, ch, Event{Tool: &ToolEvent{
+						Name:    call.Name,
+						Args:    argsPreview,
+						Phase:   PhaseEnd,
+						Result:  resultSummary,
+						IsError: result.IsError,
+					}}) {
+						for m := i + 1; m < len(calls); m++ {
+							if results[m].ToolCallID == "" {
+								results[m] = llm.ToolResult{
+									ToolCallID: calls[m].ID,
+									Content:    noticeCancelled,
+									IsError:    true,
+								}
+							}
+						}
+						return results, false
+					}
+				}
+				i++
+
+			case permission.Allow:
+				// 直接执行
+				// Start 事件
+				if !emit(ctx, ch, Event{Tool: &ToolEvent{
+					Name:  call.Name,
+					Args:  argsPreview,
+					Phase: PhaseStart,
+				}}) {
+					for m := i; m < len(calls); m++ {
+						if results[m].ToolCallID == "" {
+							results[m] = llm.ToolResult{
+								ToolCallID: calls[m].ID,
+								Content:    noticeCancelled,
+								IsError:    true,
+							}
+						}
+					}
+					return results, false
+				}
+
+				tctx, cancel := context.WithTimeout(ctx, tool.DefaultTimeout)
+				result := a.registry.Execute(tctx, call.Name, call.Input)
+				cancel()
+
+				results[i] = llm.ToolResult{
+					ToolCallID: call.ID,
+					Content:    result.Content,
+					IsError:    result.IsError,
+				}
+
+				// End 事件
+				resultSummary := argPreview(json.RawMessage(result.Content))
+				resultSummary = truncateLines(resultSummary, 8)
+				if !emit(ctx, ch, Event{Tool: &ToolEvent{
+					Name:    call.Name,
+					Args:    argsPreview,
+					Phase:   PhaseEnd,
+					Result:  resultSummary,
+					IsError: result.IsError,
+				}}) {
+					for m := i + 1; m < len(calls); m++ {
+						if results[m].ToolCallID == "" {
+							results[m] = llm.ToolResult{
+								ToolCallID: calls[m].ID,
+								Content:    noticeCancelled,
+								IsError:    true,
+							}
+						}
+					}
+					return results, false
+				}
+				i++
 			}
-			i++
 		}
 	}
 
@@ -399,6 +565,28 @@ func executeBatched(ctx context.Context, registry *tool.Registry, calls []llm.To
 	}
 
 	return results, true
+}
+
+// requestApproval 发送人在回路待批准请求，阻塞等待 TUI 回传决策。
+// 返回 (Outcome, true) 表示收到决策；(0, false) 表示 ctx 已取消。
+func (a *Agent) requestApproval(ctx context.Context, call llm.ToolCall, reason string, ch chan<- Event) (permission.Outcome, bool) {
+	respond := make(chan permission.Outcome, 1)
+	req := &ApprovalRequest{
+		Name:    call.Name,
+		Args:    argPreview(call.Input),
+		Reason:  reason,
+		Respond: respond,
+	}
+	if !emit(ctx, ch, Event{Approval: req}) {
+		return 0, false
+	}
+
+	select {
+	case o := <-respond:
+		return o, true
+	case <-ctx.Done():
+		return 0, false
+	}
 }
 
 // emit 尝试向 ch 发送事件，返回 true。若 ctx 已取消则返回 false。

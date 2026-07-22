@@ -8,6 +8,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"mewcode/internal/agent"
+	"mewcode/internal/permission"
 )
 
 var (
@@ -40,6 +41,15 @@ var (
 
 	spinnerStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#888888"))
+
+	// 权限模式标签颜色
+	modeDefaultStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#44CC44"))                                       // 绿
+	modeAcceptStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#44CCCC"))                                       // 青
+	modePlanStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#CCCC44"))                                       // 黄
+	modeBypassStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF4444"))                                       // 红
+	approvalStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFCC44"))                                       // 金
+	approvalGrayStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#888888"))                                       // 灰
+	approvalHighStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Background(lipgloss.Color("#444444")) // 高亮
 )
 
 // toolLine 渲染 Claude Code 风格工具行：● 工具名(参数)
@@ -83,6 +93,8 @@ func (m *Model) View() tea.View {
 	switch m.state {
 	case stateSelecting:
 		return tea.NewView(m.viewSelecting())
+	case stateApproving:
+		return tea.NewView(m.viewApproving())
 	default:
 		return tea.NewView(m.viewChat())
 	}
@@ -105,6 +117,19 @@ func (m *Model) viewChat() string {
 	// 状态栏
 	b.WriteString(m.renderStatusBar())
 
+	return b.String()
+}
+
+// viewApproving 人在回路待批准视图。
+func (m *Model) viewApproving() string {
+	var b strings.Builder
+
+	if m.pending != nil {
+		b.WriteString(renderApprovalBlock(m.pending, m.approveCursor))
+		b.WriteString("\n")
+	}
+
+	b.WriteString(m.renderStatusBar())
 	return b.String()
 }
 
@@ -145,14 +170,10 @@ func (m *Model) renderStreamingReply() string {
 }
 
 func (m *Model) renderStatusBar() string {
-	left := ""
+	left := modeLabel(m.mode)
 	right := ""
 
 	if m.provider != nil {
-		left = m.provider.Name()
-		if m.mode == agent.ModePlan {
-			left += " PLAN"
-		}
 		right = m.provider.Model()
 		// 累计 token 用量
 		if m.usageIn > 0 || m.usageOut > 0 {
@@ -165,7 +186,21 @@ func (m *Model) renderStatusBar() string {
 		width = 80
 	}
 
-	leftStyled := statusBarStyle.Render(left)
+	// 模式标签着色
+	var leftStyled string
+	switch m.mode {
+	case permission.ModeDefault:
+		leftStyled = modeDefaultStyle.Render(" " + left + " ")
+	case permission.ModeAcceptEdits:
+		leftStyled = modeAcceptStyle.Render(" " + left + " ")
+	case permission.ModePlan:
+		leftStyled = modePlanStyle.Render(" " + left + " ")
+	case permission.ModeBypass:
+		leftStyled = modeBypassStyle.Render(" " + left + " ")
+	default:
+		leftStyled = statusBarStyle.Render(left)
+	}
+
 	rightStyled := statusBarStyle.Render(right)
 	padding := width - lipgloss.Width(leftStyled) - lipgloss.Width(rightStyled)
 	if padding < 1 {
@@ -190,4 +225,53 @@ func formatCompact(n int64) string {
 // renderNoticeBlock 渲染灰色通知提示块。
 func renderNoticeBlock(text string) string {
 	return statusBarStyle.Render("● " + text)
+}
+
+// renderApprovalBlock 渲染人在回路待批准块（多行三选菜单）。
+func renderApprovalBlock(req *agent.ApprovalRequest, cursor int) string {
+	var sb strings.Builder
+
+	// 标题行：● 工具名(参数)
+	sb.WriteString(approvalStyle.Render(fmt.Sprintf("● %s(%s)", req.Name, req.Args)))
+	sb.WriteString("\n")
+
+	// 缩进参数预览
+	if req.Args != "" {
+		sb.WriteString(approvalGrayStyle.Render(fmt.Sprintf("  参数：%s", req.Args)))
+		sb.WriteString("\n")
+	}
+
+	// 触发原因
+	sb.WriteString(approvalGrayStyle.Render(fmt.Sprintf("  原因：%s", req.Reason)))
+	sb.WriteString("\n")
+
+	// 提示
+	sb.WriteString("\n")
+	sb.WriteString(approvalStyle.Render("  是否继续？"))
+	sb.WriteString("\n\n")
+
+	// 三行菜单
+	options := []struct {
+		label   string
+		desc    string
+		outcome permission.Outcome
+	}{
+		{"1. 允许本次", "仅本次放行，不记录规则", permission.OutcomeAllowOnce},
+		{"2. 永久允许（写入本地配置）", "记录精确 allow 规则，跨会话生效", permission.OutcomeAllowForever},
+		{"3. 拒绝本次", "回灌错误给模型，让其调整策略", permission.OutcomeDenyOnce},
+	}
+
+	for i, opt := range options {
+		if i == cursor {
+			sb.WriteString(approvalHighStyle.Render(fmt.Sprintf(" > %s", opt.label)))
+		} else {
+			sb.WriteString(approvalGrayStyle.Render(fmt.Sprintf("   %s", opt.label)))
+		}
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString("\n")
+	sb.WriteString(approvalGrayStyle.Render("  ↑↓ 选择 · 回车确认 · Esc 取消"))
+
+	return sb.String()
 }

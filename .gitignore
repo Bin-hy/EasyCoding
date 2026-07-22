@@ -1,5 +1,7 @@
 # MewCode 配置（含真实 API 密钥）
 mewcode/.mewcode/config.yaml
+# MewCode 本地权限规则（含个人放行记录）
+mewcode/.mewcode/settings.local.yaml
 
 # ============ macOS 系统文件 ============
 .DS_Store

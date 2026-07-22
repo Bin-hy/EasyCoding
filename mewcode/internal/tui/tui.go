@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	_ "embed"
+	"fmt"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"mewcode/internal/config"
 	"mewcode/internal/conversation"
 	"mewcode/internal/llm"
+	"mewcode/internal/permission"
 	"mewcode/internal/prompt"
 	"mewcode/internal/tool"
 )
@@ -26,6 +28,7 @@ const (
 	stateSelecting sessionState = iota // 多 provider 时的选择界面
 	stateIdle                          // 等待用户输入
 	stateStreaming                     // 等待/接收模型流
+	stateApproving                     // 人在回路待批准
 )
 
 // embed 自定义 glamour 样式：基于 light 主题，但 document margin 为 0
@@ -51,6 +54,7 @@ type Model struct {
 	provider  llm.Provider
 	registry  *tool.Registry
 	conv      *conversation.Conversation
+	engine    *permission.Engine // 权限引擎
 
 	// 流式状态
 	ctx        context.Context
@@ -60,10 +64,14 @@ type Model struct {
 	curReply   strings.Builder
 	curTools   []toolDisplay // 替换单个 curTool，支持并发批
 	turnStart  time.Time
-	mode       agent.Mode // 当前模式（Normal / Plan），跨轮保持
-	iter       int        // 当前迭代轮次
-	usageIn    int64      // 会话累计输入 token
-	usageOut   int64      // 会话累计输出 token
+	mode       permission.Mode // 当前权限模式，跨轮保持
+	iter       int             // 当前迭代轮次
+	usageIn    int64           // 会话累计输入 token
+	usageOut   int64           // 会话累计输出 token
+
+	// 人在回路状态
+	pending       *agent.ApprovalRequest // 当前待批准请求
+	approveCursor int                    // 待批准菜单光标位置 (0/1/2)
 
 	width  int
 	height int
@@ -89,8 +97,8 @@ func newRenderer(width int) *glamour.TermRenderer {
 	return r
 }
 
-// New 创建 TUI Model
-func New(providers []config.ProviderConfig, version string, registry *tool.Registry) *Model {
+// New 创建 TUI Model（保持 (Model, error) 返回）。
+func New(providers []config.ProviderConfig, version string, registry *tool.Registry, engine *permission.Engine) *Model {
 	if len(providers) == 0 {
 		providers = []config.ProviderConfig{{Name: "default", Protocol: "anthropic", Model: "unknown"}}
 	}
@@ -105,16 +113,22 @@ func New(providers []config.ProviderConfig, version string, registry *tool.Regis
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 
+	startMode := permission.ModeDefault
+	if engine != nil {
+		startMode = engine.StartMode()
+	}
+
 	m := &Model{
 		textarea:  ta,
 		spinner:   sp,
 		renderer:  newRenderer(80),
 		providers: providers,
 		registry:  registry,
+		engine:    engine,
 		conv:      &conversation.Conversation{},
 		version:   version,
 		width:     80,
-		mode:      agent.ModeNormal,
+		mode:      startMode,
 	}
 
 	if len(providers) == 1 {
@@ -156,9 +170,16 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyPressMsg:
-		// Ctrl+C：streaming 时取消本轮，否则退出程序
+		// Ctrl+C：streaming/approving 时取消本轮，否则退出程序
 		if msg.String() == "ctrl+c" {
-			if m.state == stateStreaming {
+			if m.state == stateStreaming || m.state == stateApproving {
+				if m.state == stateApproving && m.pending != nil {
+					// 兜底解除 agent 阻塞
+					select {
+					case m.pending.Respond <- permission.OutcomeDenyOnce:
+					default:
+					}
+				}
 				if m.turnCancel != nil {
 					m.turnCancel()
 				}
@@ -170,15 +191,29 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 
-		// Esc：streaming 时取消本轮
+		// Esc：streaming/approving 时取消本轮
 		if msg.Code == tea.KeyEscape {
-			if m.state == stateStreaming {
+			if m.state == stateStreaming || m.state == stateApproving {
+				if m.state == stateApproving && m.pending != nil {
+					// 兜底解除 agent 阻塞
+					select {
+					case m.pending.Respond <- permission.OutcomeDenyOnce:
+					default:
+					}
+				}
 				if m.turnCancel != nil {
 					m.turnCancel()
 				}
 				return m, waitForEvent(m.events)
 			}
 			return m, nil
+		}
+
+		// Shift+Tab：循环切换权限模式（仅 idle 态生效）
+		if msg.String() == "shift+tab" && m.state == stateIdle {
+			m.mode = nextMode(m.mode)
+			notice := fmt.Sprintf("已切换到 %s 模式", modeLabel(m.mode))
+			return m, tea.Println(renderNoticeBlock(notice))
 		}
 
 		switch m.state {
@@ -188,9 +223,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleIdleKey(msg)
 		case stateStreaming:
 			return m, nil
+		case stateApproving:
+			return m.updateApproving(msg)
 		}
 
 	case agentEvent:
+		if m.state == stateApproving {
+			return m.updateApproving(msg)
+		}
 		return m.handleAgentEvent(msg)
 
 	case spinner.TickMsg:
@@ -202,70 +242,25 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// handleIdleKey 处理空闲状态的键盘输入
-func (m *Model) handleIdleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	switch msg.Code {
-	case tea.KeyEnter:
-		if msg.Mod&tea.ModAlt != 0 {
-			var cmd tea.Cmd
-			m.textarea, cmd = m.textarea.Update(msg)
-			return m, cmd
-		}
-
-		text := strings.TrimSpace(m.textarea.Value())
-		m.textarea.Reset()
-
-		if text == "" {
-			return m, nil
-		}
-
-		if text == "/exit" {
-			return m, tea.Quit
-		}
-
-		return m.submitMessage(text)
-	}
-
-	var cmd tea.Cmd
-	m.textarea, cmd = m.textarea.Update(msg)
-	return m, cmd
+// nextMode 循环切换权限模式：default → acceptEdits → plan → bypassPermissions → default
+func nextMode(m permission.Mode) permission.Mode {
+	return (m + 1) % 4
 }
 
-// submitMessage 提交用户消息并通过 agent 发起流式请求。
-// 识别 /plan、/do 特殊命令。
-func (m *Model) submitMessage(text string) (tea.Model, tea.Cmd) {
-	switch {
-	case text == "/plan":
-		m.mode = agent.ModePlan
-		return m, tea.Println(renderNoticeBlock("已进入计划模式（只读工具，产出计划后请用 /do 执行）"))
-
-	case text == "/do":
-		m.mode = agent.ModeNormal
-		m.conv.AddUser(prompt.ExecuteDirective)
-		// fall through to start streaming
-
+// modeLabel 返回模式在状态栏的显示标签。
+func modeLabel(m permission.Mode) string {
+	switch m {
+	case permission.ModeDefault:
+		return "DEFAULT"
+	case permission.ModeAcceptEdits:
+		return "ACCEPT EDITS"
+	case permission.ModePlan:
+		return "PLAN"
+	case permission.ModeBypass:
+		return "BYPASS"
 	default:
-		m.conv.AddUser(text)
+		return "UNKNOWN"
 	}
-
-	// 启动 per-turn 上下文
-	turnCtx, turnCancel := context.WithCancel(context.Background())
-	m.turnCancel = turnCancel
-
-	a := agent.New(m.provider, m.registry, m.version)
-	m.events = a.Run(turnCtx, m.conv, m.mode)
-	m.turnStart = time.Now()
-	m.curReply.Reset()
-	m.curTools = nil
-	m.iter = 0
-	m.state = stateStreaming
-
-	userBlock := renderUserBlock(text)
-	return m, tea.Batch(
-		tea.Println(userBlock),
-		waitForEvent(m.events),
-		m.spinner.Tick,
-	)
 }
 
 // handleAgentEvent 处理 agent 事件
@@ -274,6 +269,13 @@ func (m *Model) handleAgentEvent(ev agentEvent) (tea.Model, tea.Cmd) {
 	case ev.Err != nil:
 		errorBlock := renderErrorBlock(ev.Err.Error())
 		return m.finishTurn(), tea.Println(errorBlock)
+
+	case ev.Approval != nil:
+		// 人在回路待批准
+		m.pending = ev.Approval
+		m.approveCursor = 0
+		m.state = stateApproving
+		return m, nil // 不 waitForEvent，agent 正阻塞等回传
 
 	case ev.Tool != nil && ev.Tool.Phase == agent.PhaseStart:
 		// 首个工具前先提交 preamble
@@ -338,6 +340,60 @@ func (m *Model) handleAgentEvent(ev agentEvent) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// updateApproving 处理待批准态的按键输入。返回 (Model, Cmd)。
+func (m *Model) updateApproving(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyPressMsg:
+		switch msg.String() {
+		case "up", "k":
+			if m.approveCursor > 0 {
+				m.approveCursor--
+			}
+			return m, nil
+		case "down", "j":
+			if m.approveCursor < 2 {
+				m.approveCursor++
+			}
+			return m, nil
+		case "enter", " ":
+			return m.commitApproval(outcomeForIndex(m.approveCursor))
+		case "1":
+			return m.commitApproval(permission.OutcomeAllowOnce)
+		case "2":
+			return m.commitApproval(permission.OutcomeAllowForever)
+		case "3":
+			return m.commitApproval(permission.OutcomeDenyOnce)
+		}
+	}
+	return m, nil
+}
+
+// outcomeForIndex 将光标索引映射到 Outcome。
+func outcomeForIndex(idx int) permission.Outcome {
+	switch idx {
+	case 0:
+		return permission.OutcomeAllowOnce
+	case 1:
+		return permission.OutcomeAllowForever
+	case 2:
+		return permission.OutcomeDenyOnce
+	default:
+		return permission.OutcomeDenyOnce
+	}
+}
+
+// commitApproval 向 agent 回传决策，切回 streaming 态。
+func (m *Model) commitApproval(outcome permission.Outcome) (tea.Model, tea.Cmd) {
+	if m.pending == nil {
+		return m, nil
+	}
+	m.pending.Respond <- outcome
+	m.pending = nil
+	m.state = stateStreaming
+	m.approveCursor = 0
+	return m, waitForEvent(m.events)
+}
+
 // finishTurn 清理本轮状态，回空闲态（保留 mode、usage 跨轮）。
 func (m *Model) finishTurn() *Model {
 	m.curReply.Reset()
@@ -357,6 +413,72 @@ func (m *Model) handleSpinnerTick(msg spinner.TickMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.spinner, cmd = m.spinner.Update(msg)
 	return m, cmd
+}
+
+// handleIdleKey 处理空闲状态的键盘输入
+func (m *Model) handleIdleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	switch msg.Code {
+	case tea.KeyEnter:
+		if msg.Mod&tea.ModAlt != 0 {
+			var cmd tea.Cmd
+			m.textarea, cmd = m.textarea.Update(msg)
+			return m, cmd
+		}
+
+		text := strings.TrimSpace(m.textarea.Value())
+		m.textarea.Reset()
+
+		if text == "" {
+			return m, nil
+		}
+
+		if text == "/exit" {
+			return m, tea.Quit
+		}
+
+		return m.submitMessage(text)
+	}
+
+	var cmd tea.Cmd
+	m.textarea, cmd = m.textarea.Update(msg)
+	return m, cmd
+}
+
+// submitMessage 提交用户消息并通过 agent 发起流式请求。
+// 识别 /plan、/do 特殊命令。
+func (m *Model) submitMessage(text string) (tea.Model, tea.Cmd) {
+	switch {
+	case text == "/plan":
+		m.mode = permission.ModePlan
+		return m, tea.Println(renderNoticeBlock("已进入计划模式（只读工具，产出计划后请用 /do 执行）"))
+
+	case text == "/do":
+		m.mode = permission.ModeDefault
+		m.conv.AddUser(prompt.ExecuteDirective)
+		// fall through to start streaming
+
+	default:
+		m.conv.AddUser(text)
+	}
+
+	// 启动 per-turn 上下文
+	turnCtx, turnCancel := context.WithCancel(context.Background())
+	m.turnCancel = turnCancel
+
+	a := agent.New(m.provider, m.registry, m.version, m.engine)
+	m.events = a.Run(turnCtx, m.conv, m.mode)
+	m.turnStart = time.Now()
+	m.curReply.Reset()
+	m.curTools = nil
+	m.iter = 0
+	m.state = stateStreaming
+
+	userBlock := renderUserBlock(text)
+	return m, tea.Batch(
+		tea.Println(userBlock),
+		waitForEvent(m.events),
+		m.spinner.Tick,
+	)
 }
 
 // Run 启动 TUI
