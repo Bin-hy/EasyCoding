@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 
 	"mewcode/internal/config"
+	"mewcode/internal/mcp"
 	"mewcode/internal/permission"
 	"mewcode/internal/tool"
 	"mewcode/internal/tui"
@@ -20,11 +22,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 构造工具注册中心
+	// 构造工具注册中心（6 内置工具）
 	reg := tool.NewDefaultRegistry()
 
-	// 构造权限引擎（前四层防御 + 三层配置加载）
+	// 加载 MCP 配置并连接远端 server
 	root, _ := os.Getwd()
+	mcpCfg, _ := mcp.LoadConfig(root)
+	mgr := mcp.NewManager(context.Background(), mcpCfg, version)
+	defer mgr.Close()
+	for _, t := range mgr.Tools() {
+		reg.Register(t)
+	}
+
+	// 构造权限引擎（前四层防御 + 三层配置加载）
 	eng, err := permission.NewEngine(root)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "权限引擎降级: %v\n", err)
