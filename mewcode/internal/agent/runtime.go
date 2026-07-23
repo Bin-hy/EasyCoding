@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"mewcode/internal/compact"
+	"mewcode/internal/memory"
 )
 
 // SessionRuntime 跨 Run 调用的长生命周期状态容器。
@@ -16,7 +17,8 @@ type SessionRuntime struct {
 	ContextWindow int
 	UsageAnchor   int64      // 主对话路径 Stream 真实 usage 之和；摘要请求不更新
 	AnchorMsgLen  int        // anchor 当时 Conversation.Len()
-	mu            sync.Mutex // 保护 UsageAnchor / AnchorMsgLen 的读写
+	TurnCount     int        // 会话轮次计数（用于记忆更新触发）
+	mu            sync.Mutex // 保护 UsageAnchor / AnchorMsgLen / TurnCount 的读写
 }
 
 // UpdateAnchor 更新 token 估算锚点。
@@ -42,6 +44,14 @@ func (r *SessionRuntime) GetAnchor() (int64, int) {
 	return r.UsageAnchor, r.AnchorMsgLen
 }
 
+// IncTurn 递增轮次计数。
+func (r *SessionRuntime) IncTurn() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.TurnCount++
+	return r.TurnCount
+}
+
 // Option 函数式选项，用于 New 的可选参数注入。
 type Option func(*Agent)
 
@@ -49,5 +59,26 @@ type Option func(*Agent)
 func WithRuntime(r *SessionRuntime) Option {
 	return func(a *Agent) {
 		a.runtime = r
+	}
+}
+
+// WithMemoryManager 注入记忆更新管理器。
+func WithMemoryManager(m *memory.Manager) Option {
+	return func(a *Agent) {
+		a.memMgr = m
+	}
+}
+
+// WithInstructionText 注入项目指令文本。
+func WithInstructionText(text string) Option {
+	return func(a *Agent) {
+		a.instructionText = text
+	}
+}
+
+// WithMemoryText 注入记忆索引文本。
+func WithMemoryText(text string) Option {
+	return func(a *Agent) {
+		a.memoryText = text
 	}
 }

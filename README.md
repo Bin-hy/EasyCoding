@@ -226,9 +226,40 @@ mcp_servers:
 不再是写死一段 Prompt 字符串。系统提示通过**模块化装配**生成：
 
 - **7 个固定模块** — 按 Priority 排序拼接，跨调用逐字节稳定（供 Anthropic Prompt Cache 命中）
-- **3 个可选空槽** — 供后续扩展动态注入
+- **custom-instructions（priority 80）** — 从三层 MEWCODE.md 加载项目/用户指令自动注入
+- **long-term-memory（priority 100）** — 自动笔记索引注入，Agent 从第一轮就了解先前提取的知识
 - **环境信息段** — 每轮变化的 OS / Shell / 日期 / 工作目录单独渲染，不破坏缓存段
 - **Plan Mode 提醒** — 首轮注入完整约束，后续每 3 轮注入简化版，控制 token 消耗
+
+### 🗂️ 项目指令文件
+
+在项目根、`.mewcode/`、`~/.mewcode/` 三层各放一份 `MEWCODE.md`，启动时自动加载并注入系统提示。高优先级排前面让模型优先遵循。
+
+- **三层优先级合并** — 项目根 > 项目配置 > 用户级，缺失层静默跳过
+- **@include 引用** — 支持 `@include sub/rules.md` 拆分指令文件，5 层嵌套深度限制
+- **安全防御** — visited 集合防环路、路径逃逸检测（不能 include 项目目录外的文件）、二进制检测
+
+### 💾 会话存档（JSONL）
+
+对话历史实时追加写入 `.mewcode/sessions/<id>/conversation.jsonl`，一行一条 JSON：
+
+- **追加写** — 崩溃最多丢最后一行，不重写已有内容、不维护单独的 meta 文件
+- **实时 Sync** — 每次写入后 `fsync` 刷盘，外部进程 `tail -f` 可见
+- **压缩标记** — 上下文压缩时写入 compact 标记行，恢复时从最后标记之后加载
+- **/resume 命令** — 上下键浏览历史会话、输入搜索过滤、Enter 恢复、Esc 取消
+- **恢复容错** — 坏行跳过、孤立工具调用截断、token 超限自动压缩、超过 6h 插入时间跨度提醒
+- **自动清理** — 30 天以上旧会话启动时后台清理
+
+### 🧠 自动笔记
+
+Agent 每轮自然停下后，异步提取值得记住的信息，分类存为持久化笔记：
+
+- **四类笔记** — 用户偏好、纠正反馈、项目知识、参考资料
+- **两级存储** — 项目级 `.mewcode/memory/` + 用户级 `~/.mewcode/memory/`
+- **触发时机** — 每 5 轮自动触发 + 检测到"记住/记忆/remember/memo"关键词立即触发
+- **LLM 去重** — 更新请求包含完整现有索引，让模型自行判断合并或跳过
+- **异步不阻塞** — goroutine 中执行，用户可继续对话；更新失败静默记录日志
+- **自动注入** — 笔记索引在后续会话中自动注入系统提示（约 2-3K tokens）
 
 ## 🔧 工具系统
 
@@ -385,7 +416,7 @@ mewcode/
 │   │   └── openai.go            ── OpenAI Chat Completions 适配器
 │   │
 │   ├── conversation/            ── 对话历史管理器
-│   │   └── 维护 user / assistant / tool 多轮消息列表，角色交替校验
+│   │   └── 维护 user / assistant / tool 多轮消息列表，角色交替校验，支持追加/替换回调
 │   │
 │   ├── agent/                   ── 多轮 ReAct 编排引擎
 │   │   └── Run(ctx, conv, mode) → <-chan Event
@@ -421,13 +452,30 @@ mewcode/
 │   │
 │   ├── prompt/                  ── 系统提示工程化
 │   │   ├── prompt.go            ── BuildSystemPrompt / AssembleSystem / RenderBanner
-│   │   ├── modules.go           ── 7 固定模块 + 3 可选空槽（按 Priority 排序）
+│   │   ├── modules.go           ── 7 固定模块 + custom-instructions / long-term-memory 可选槽
 │   │   ├── environment.go       ── 环境信息采集（OS / Shell / 日期 / 工作目录）
 │   │   └── reminder.go          ── Plan Mode 提醒（首轮全量 / 后续简化，按轮次注入）
+│   │
+│   ├── instructions/            ── 项目指令文件加载
+│   │   └── loader.go            ── 三层 MEWCODE.md + @include 深度限制/环路检测/逃逸拦截
+│   │
+│   ├── session/                 ── 会话持久化（JSONL 存档）
+│   │   ├── writer.go            ── JSONL 追加写、Sync 刷盘、compact 标记
+│   │   ├── list.go              ── 会话列表扫描 + SessionInfo 摘要
+│   │   ├── load.go              ── 会话恢复（坏行跳过、孤立工具调用截断）
+│   │   └── cleanup.go           ── 30 天过期会话后台清理
+│   │
+│   ├── memory/                  ── 自动笔记系统
+│   │   ├── types.go             ── NoteType（4 类）、Note、UpdateAction
+│   │   ├── store.go             ── 笔记文件 CRUD + MEMORY.md 索引管理
+│   │   ├── manager.go           ── 异步 LLM 记忆更新、索引注入系统提示
+│   │   └── prompt.go            ── 记忆提取系统提示模板
 │   │
 │   └── tui/                     ── Bubble Tea 终端界面
 │       ├── tui.go               ── Model / Update / 状态机 / 人在回路弹窗
 │       ├── view.go              ── 视图渲染：用户块、助手块、工具行、状态栏
+│       ├── commands.go          ── 内置命令分发 (/exit /plan /do /compact /resume)
+│       ├── resume.go            ── /resume 会话列表 UI + 恢复流程
 │       ├── stream.go            ── agent Event → bubbletea Msg 桥接
 │       └── select.go            ── 多 Provider 选择列表
 │
@@ -446,13 +494,18 @@ mewcode/
 ### 数据流
 
 ```
+启动时:
+  instructions.NewLoader(root).Load() ──→ instructionText ──→ BuildSystemPrompt()
+  memory.NewManager(...).LoadIndex()   ──→ memoryText ───────→ BuildSystemPrompt()
+  session.NewWriter(sessionDir)        ──→ JSONL 追加写回调 ──→ conversation 钩子
+
 用户键盘输入
      │
      ▼
  TUI (Bubble Tea) ──→ Agent.Run(ctx, conv, mode)
                            │
-                           ├─→ prompt.BuildSystemPrompt() ──→ 缓存命中
-                           ├─→ prompt.GatherEnvironment()  ──→ 变化段
+                           ├─→ prompt.BuildSystemPrompt(instructions, memory) ──→ 缓存命中
+                           ├─→ prompt.GatherEnvironment()                    ──→ 变化段
                            │
                            ▼  ReAct 循环（最多 10 轮）
                            │
@@ -472,8 +525,15 @@ mewcode/
                            │       ▼
                            │   Provider.Stream() #N ──→ 续答 / 再调工具 / 完成
                            │
+                           ├─→ 完成（无工具调用）
+                           │   ├─→ conv.AddAssistant(text) ──→ onAppend → JSONL 追加写
+                           │   └─→ 每 5 轮 / 关键词触发 → goroutine 异步记忆更新
+                           │
                            ▼
                       Event 流 → chan → bubbletea Msg → Update → View
+
+/resume 恢复:
+  /resume → ListSessions() → 列表 UI → 选择 → LoadSession() → 重建 conv/writer/sessionCtx
 ```
 
 ## 🧪 开发
@@ -550,9 +610,10 @@ func (t *myTool) Execute(ctx context.Context, args json.RawMessage) tool.Result 
 | ch05 | 五层权限防御：黑名单 → 沙箱 → 规则引擎 → 模式兜底 → 人在回路 | ✅ 完成 |
 | ch06 | 系统提示工程化：模块化装配、缓存通道、Plan Mode 按轮次注入 | ✅ 完成 |
 | ch07 | MCP 协议：stdio / HTTP 双传输、配置驱动自动发现、命名空间隔离、失败隔离 | ✅ 完成 |
-| ch08 | 会话持久化：保存 / 恢复对话历史 | 🚧 规划中 |
-| ch09 | LSP 集成：代码智能（跳转定义、查找引用、诊断） | 📋 待排期 |
-| ch10 | 插件系统：用户自定义工具加载器 | 📋 待排期 |
+| ch08 | 上下文管理：工具结果溢出落盘、内容替换决策、两层摘要压缩、自动压缩熔断 | ✅ 完成 |
+| ch09 | 项目记忆与会话持久化：指令文件、JSONL 存档、/resume 恢复、自动笔记 | ✅ 完成 |
+| ch10 | LSP 集成：代码智能（跳转定义、查找引用、诊断） | 📋 待排期 |
+| ch11 | 插件系统：用户自定义工具加载器 | 📋 待排期 |
 
 > 路线图会随着开发推进持续更新。欢迎提 Issue 和 PR！
 

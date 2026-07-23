@@ -14,36 +14,78 @@ import (
 
 // SessionContext 会话生命周期信息，进程启动时一次性生成。
 type SessionContext struct {
-	SessionID string // 格式：<unix_ts>-<hex>
-	SpillDir  string // 落盘目录 .mewcode/sessions/<session_id>/tool-results/
+	SessionID  string // 格式：YYYYMMDD-HHMMSS-xxxx
+	SessionDir string // <workspace>/.mewcode/sessions/<SessionID>
+	SpillDir   string // SessionDir + "/tool-results"
 }
 
 // newSessionID 生成会话唯一标识。
-// 优先用 crypto/rand 取 4 字节随机数；失败时降级为伪随机。
+// 格式：YYYYMMDD-HHMMSS-xxxx，前半段取本地时间，后半段 4 字符随机十六进制防碰撞。
+// 优先用 crypto/rand；失败时降级为伪随机。
 func newSessionID() string {
+	timePart := time.Now().Format("20060102-150405")
+
 	var hexStr string
-	b := make([]byte, 4)
+	b := make([]byte, 2) // 2 字节 = 4 字符十六进制
 	if _, err := rand.Read(b); err == nil {
 		hexStr = hex.EncodeToString(b)
 	} else {
 		// crypto/rand 不可用时降级
-		n, _ := rand.Int(rand.Reader, big.NewInt(1<<32))
+		n, _ := rand.Int(rand.Reader, big.NewInt(1<<16))
 		if n == nil {
 			n = big.NewInt(0)
 		}
-		hexStr = fmt.Sprintf("%08x", n.Uint64()&0xFFFFFFFF)
+		hexStr = fmt.Sprintf("%04x", n.Uint64()&0xFFFF)
 	}
-	return fmt.Sprintf("%d-%s", time.Now().Unix(), hexStr)
+	return fmt.Sprintf("%s-%s", timePart, hexStr)
 }
 
 // NewSessionContext 创建会话上下文并建立落盘目录。
 func NewSessionContext(workspace string) (*SessionContext, error) {
 	id := newSessionID()
-	spillDir := filepath.Join(workspace, ".mewcode", "sessions", id, "tool-results")
+	sessionDir := filepath.Join(workspace, ".mewcode", "sessions", id)
+	spillDir := filepath.Join(sessionDir, "tool-results")
 	if err := os.MkdirAll(spillDir, 0o755); err != nil {
 		return nil, fmt.Errorf("创建会话目录失敗: %w", err)
 	}
-	return &SessionContext{SessionID: id, SpillDir: spillDir}, nil
+	return &SessionContext{
+		SessionID:  id,
+		SessionDir: sessionDir,
+		SpillDir:   spillDir,
+	}, nil
+}
+
+// OpenSessionContext 打开已有会话目录，不创建新目录。
+// workspace 为项目根目录，sessionID 为已有的 session ID。
+func OpenSessionContext(workspace, sessionID string) (*SessionContext, error) {
+	sessionDir := filepath.Join(workspace, ".mewcode", "sessions", sessionID)
+	info, err := os.Stat(sessionDir)
+	if err != nil {
+		return nil, fmt.Errorf("会话目录不存在: %w", err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("会话路径不是目录: %s", sessionDir)
+	}
+	return &SessionContext{
+		SessionID:  sessionID,
+		SessionDir: sessionDir,
+		SpillDir:   filepath.Join(sessionDir, "tool-results"),
+	}, nil
+}
+
+// ParseSessionTime 从新格式 session ID 中解析出时间戳。
+// 新格式前 15 位为 "YYYYMMDD-HHMMSS"。
+// 旧格式（如 "<unix_ts>-<hex>"）无法解析，返回 error。
+func ParseSessionTime(sessionID string) (time.Time, error) {
+	if len(sessionID) < 15 {
+		return time.Time{}, fmt.Errorf("session ID 太短，非新格式: %s", sessionID)
+	}
+	timeStr := sessionID[:15] // "YYYYMMDD-HHMMSS"
+	t, err := time.ParseInLocation("20060102-150405", timeStr, time.Local)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("无法从 session ID 解析时间: %w", err)
+	}
+	return t, nil
 }
 
 // ContentReplacementState 会话级工具结果替换决策账本。

@@ -5,12 +5,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"mewcode/internal/agent"
 	"mewcode/internal/compact"
 	"mewcode/internal/config"
+	"mewcode/internal/conversation"
+	"mewcode/internal/instructions"
 	"mewcode/internal/mcp"
+	"mewcode/internal/memory"
 	"mewcode/internal/permission"
+	"mewcode/internal/session"
 	"mewcode/internal/tool"
 	"mewcode/internal/tui"
 )
@@ -39,11 +44,32 @@ func main() {
 		os.Exit(1)
 	}
 
+	root, _ := os.Getwd()
+
+	// --- ch09: 加载项目指令 ---
+	loader := instructions.NewLoader(root)
+	instructionText, err := loader.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[instructions] 加载项目指令失败: %v\n", err)
+	}
+	if instructionText != "" {
+		fmt.Fprintf(os.Stderr, "[instructions] 项目指令已加载 (%d 字符)\n", len(instructionText))
+	}
+
+	// --- ch09: 初始化记忆管理器 ---
+	userHome, _ := os.UserHomeDir()
+	projectMemDir := filepath.Join(root, ".mewcode", "memory")
+	userMemDir := filepath.Join(userHome, ".mewcode", "memory")
+	memMgr := memory.NewManager(projectMemDir, userMemDir, nil, "") // provider 待选定后设置
+	memoryText := memMgr.LoadIndex()
+	if memoryText != "" {
+		fmt.Fprintf(os.Stderr, "[memory] 记忆索引已加载 (%d 字符)\n", len(memoryText))
+	}
+
 	// 构造工具注册中心（6 内置工具）
 	reg := tool.NewDefaultRegistry()
 
 	// 加载 MCP 配置并连接远端 server
-	root, _ := os.Getwd()
 	mcpCfg, _ := mcp.LoadConfig(root)
 	mgr := mcp.NewManager(context.Background(), mcpCfg, version)
 	defer mgr.Close()
@@ -58,8 +84,8 @@ func main() {
 		// eng 必非 nil，继续运行
 	}
 
-	// 构造会话级运行时状态
-	session, err := compact.NewSessionContext(root)
+	// --- ch09: 构造会话级运行时状态（含 SessionDir）---
+	sessionCtx, err := compact.NewSessionContext(root)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "会话初始化失败: %v\n", err)
 		os.Exit(1)
@@ -68,12 +94,38 @@ func main() {
 		Replacement:   compact.NewContentReplacementState(),
 		Recovery:      compact.NewRecoveryState(),
 		AutoTracking:  compact.NewAutoCompactTrackingState(),
-		Session:       session,
+		Session:       sessionCtx,
 		ContextWindow: cfg.Providers[0].EffectiveContextWindow(),
 	}
 
+	// --- ch09: 创建 Session JSONL Writer ---
+	writer, err := session.NewWriter(sessionCtx.SessionDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[session] 创建 JSONL Writer 失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer writer.Close()
+
+	// --- ch09: 后台清理过期会话 ---
+	sessionsDir := filepath.Join(root, ".mewcode", "sessions")
+	go func() {
+		if err := session.CleanExpired(sessionsDir, 30*24*time.Hour); err != nil {
+			fmt.Fprintf(os.Stderr, "[session] 过期会话清理失败: %v\n", err)
+		}
+	}()
+
+	// --- 使用带回调的 Conversation ---
+	modelName := ""
+	if len(cfg.Providers) > 0 {
+		modelName = cfg.Providers[0].Model
+	}
+	conv := conversation.NewWithHooks(writer.OnAppend(modelName), writer.OnReplace())
+
 	// 启动 TUI
-	m := tui.New(cfg.Providers, version, reg, eng, runtime)
+	m := tui.New(cfg.Providers, version, reg, eng, runtime, writer, memMgr, instructionText, memoryText)
+	// 注入带回调的 Conversation（覆盖 TUI 内部创建的空 Conversation）
+	m.SetConversation(conv)
+
 	if err := m.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "运行错误: %v\n", err)
 		os.Exit(1)

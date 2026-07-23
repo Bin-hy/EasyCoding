@@ -4,6 +4,7 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -16,8 +17,10 @@ import (
 	"mewcode/internal/config"
 	"mewcode/internal/conversation"
 	"mewcode/internal/llm"
+	"mewcode/internal/memory"
 	"mewcode/internal/permission"
 	"mewcode/internal/prompt"
+	"mewcode/internal/session"
 	"mewcode/internal/tool"
 )
 
@@ -29,6 +32,7 @@ const (
 	stateIdle                          // 等待用户输入
 	stateStreaming                     // 等待/接收模型流
 	stateApproving                     // 人在回路待批准
+	stateResuming                      // 会话恢复列表选择
 )
 
 // embed 自定义 glamour 样式：基于 light 主题，但 document margin 为 0
@@ -57,6 +61,14 @@ type Model struct {
 	engine    *permission.Engine    // 权限引擎
 	runtime   *agent.SessionRuntime // 跨 Run 复用的长生命周期状态
 	ag        *agent.Agent          // 常驻 Agent 实例
+
+	// ch09: 会话持久化 & 记忆
+	writer          *session.Writer // JSONL 会话写入器
+	memMgr          *memory.Manager // 记忆更新管理器
+	instructionText string          // 项目指令文本
+	memoryText      string          // 记忆索引文本
+	sessionsDir     string          // 会话存档根目录
+	resumeList      list.Model      // 会话恢复列表 UI
 
 	// 流式状态
 	cancel     context.CancelFunc // 程序级取消（idle 时 Ctrl+C 退出）
@@ -99,7 +111,7 @@ func newRenderer(width int) *glamour.TermRenderer {
 }
 
 // New 创建 TUI Model。
-func New(providers []config.ProviderConfig, version string, registry *tool.Registry, engine *permission.Engine, runtime *agent.SessionRuntime) *Model {
+func New(providers []config.ProviderConfig, version string, registry *tool.Registry, engine *permission.Engine, runtime *agent.SessionRuntime, writer *session.Writer, memMgr *memory.Manager, instructionText, memoryText string) *Model {
 	if len(providers) == 0 {
 		providers = []config.ProviderConfig{{Name: "default", Protocol: "anthropic", Model: "unknown"}}
 	}
@@ -119,18 +131,26 @@ func New(providers []config.ProviderConfig, version string, registry *tool.Regis
 		startMode = engine.StartMode()
 	}
 
+	cwd, _ := os.Getwd()
+	sessionsDir := cwd + "/.mewcode/sessions"
+
 	m := &Model{
-		textarea:  ta,
-		spinner:   sp,
-		renderer:  newRenderer(80),
-		providers: providers,
-		registry:  registry,
-		engine:    engine,
-		conv:      &conversation.Conversation{},
-		version:   version,
-		width:     80,
-		mode:      startMode,
-		runtime:   runtime,
+		textarea:        ta,
+		spinner:         sp,
+		renderer:        newRenderer(80),
+		providers:       providers,
+		registry:        registry,
+		engine:          engine,
+		conv:            conversation.New(),
+		version:         version,
+		width:           80,
+		mode:            startMode,
+		runtime:         runtime,
+		writer:          writer,
+		memMgr:          memMgr,
+		instructionText: instructionText,
+		memoryText:      memoryText,
+		sessionsDir:     sessionsDir,
 	}
 
 	if len(providers) == 1 {
@@ -141,14 +161,29 @@ func New(providers []config.ProviderConfig, version string, registry *tool.Regis
 			m.provider = p
 		}
 		m.state = stateIdle
-		// 构造常驻 Agent
-		m.ag = agent.New(m.provider, m.registry, m.version, m.engine, agent.WithRuntime(runtime))
+		// 构造常驻 Agent（含记忆管理器）
+		opts := []agent.Option{agent.WithRuntime(runtime)}
+		if memMgr != nil {
+			opts = append(opts, agent.WithMemoryManager(memMgr))
+		}
+		if instructionText != "" {
+			opts = append(opts, agent.WithInstructionText(instructionText))
+		}
+		if memoryText != "" {
+			opts = append(opts, agent.WithMemoryText(memoryText))
+		}
+		m.ag = agent.New(m.provider, m.registry, m.version, m.engine, opts...)
 	} else {
 		m.state = stateSelecting
 		m.initList()
 	}
 
 	return m
+}
+
+// SetConversation 注入带回调的 Conversation（由 main.go 创建）。
+func (m *Model) SetConversation(conv *conversation.Conversation) {
+	m.conv = conv
 }
 
 func (m *Model) Init() tea.Cmd {

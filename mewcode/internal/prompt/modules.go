@@ -70,12 +70,14 @@ func FixedModules() []Module {
 	}
 }
 
-// OptionalModules 返回三个可选空槽——Content 为空，装配时自动跳过。
-// 本章不接入真实内容来源，留待后续章节填充。
-func OptionalModules() []Module {
+// OptionalModules 返回三个可选模块。
+// instructions 非空时填入 custom-instructions（priority 80）。
+// memory 非空时填入 long-term-memory（priority 100）。
+// skills 留空（priority 90），留待后续章节填充。
+func OptionalModules(instructions, memory string) []Module {
 	return []Module{
-		{Name: "自定义指令", Priority: 80, Content: ""},
+		{Name: "自定义指令", Priority: 80, Content: instructions},
 		{Name: "已激活 Skill", Priority: 90, Content: ""},
-		{Name: "长期记忆", Priority: 100, Content: ""},
+		{Name: "长期记忆", Priority: 100, Content: memory},
 	}
 }
