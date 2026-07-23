@@ -3,8 +3,10 @@ name: Release
 on:
   push:
     tags:
-      - "v*.*.*"
-      - "v*.*.*-*"
+      - "v*"
+
+permissions:
+  contents: write
 
 defaults:
   run:
@@ -14,8 +16,6 @@ jobs:
   release:
     name: Build & Release
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     strategy:
       matrix:
         target:
