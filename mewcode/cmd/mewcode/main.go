@@ -12,7 +12,8 @@ import (
 	"mewcode/internal/tui"
 )
 
-const version = "0.1.0"
+// 构建时通过 ldflags 注入：go build -ldflags="-X 'main.version=x.y.z'"
+var version = "0.1.0"
 
 func main() {
 	// 加载配置
