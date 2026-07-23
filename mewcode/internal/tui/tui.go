@@ -54,7 +54,9 @@ type Model struct {
 	provider  llm.Provider
 	registry  *tool.Registry
 	conv      *conversation.Conversation
-	engine    *permission.Engine // 权限引擎
+	engine    *permission.Engine    // 权限引擎
+	runtime   *agent.SessionRuntime // 跨 Run 复用的长生命周期状态
+	ag        *agent.Agent          // 常驻 Agent 实例
 
 	// 流式状态
 	cancel     context.CancelFunc // 程序级取消（idle 时 Ctrl+C 退出）
@@ -96,8 +98,8 @@ func newRenderer(width int) *glamour.TermRenderer {
 	return r
 }
 
-// New 创建 TUI Model（保持 (Model, error) 返回）。
-func New(providers []config.ProviderConfig, version string, registry *tool.Registry, engine *permission.Engine) *Model {
+// New 创建 TUI Model。
+func New(providers []config.ProviderConfig, version string, registry *tool.Registry, engine *permission.Engine, runtime *agent.SessionRuntime) *Model {
 	if len(providers) == 0 {
 		providers = []config.ProviderConfig{{Name: "default", Protocol: "anthropic", Model: "unknown"}}
 	}
@@ -128,6 +130,7 @@ func New(providers []config.ProviderConfig, version string, registry *tool.Regis
 		version:   version,
 		width:     80,
 		mode:      startMode,
+		runtime:   runtime,
 	}
 
 	if len(providers) == 1 {
@@ -138,6 +141,8 @@ func New(providers []config.ProviderConfig, version string, registry *tool.Regis
 			m.provider = p
 		}
 		m.state = stateIdle
+		// 构造常驻 Agent
+		m.ag = agent.New(m.provider, m.registry, m.version, m.engine, agent.WithRuntime(runtime))
 	} else {
 		m.state = stateSelecting
 		m.initList()
@@ -265,6 +270,10 @@ func modeLabel(m permission.Mode) string {
 // handleAgentEvent 处理 agent 事件
 func (m *Model) handleAgentEvent(ev agentEvent) (tea.Model, tea.Cmd) {
 	switch {
+	case ev.Compact != nil:
+		notice := formatCompactNotice(ev.Compact)
+		return m, tea.Batch(tea.Println(renderNoticeBlock(notice)), waitForEvent(m.events))
+
 	case ev.Err != nil:
 		errorBlock := renderErrorBlock(ev.Err.Error())
 		return m.finishTurn(), tea.Println(errorBlock)
@@ -431,8 +440,9 @@ func (m *Model) handleIdleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		if text == "/exit" {
-			return m, tea.Quit
+		// 命令分发：以 / 开头走命令路径
+		if handler, ok := dispatchCommand(text); ok {
+			return m, handler(context.Background(), m)
 		}
 
 		return m.submitMessage(text)
@@ -444,28 +454,15 @@ func (m *Model) handleIdleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 // submitMessage 提交用户消息并通过 agent 发起流式请求。
-// 识别 /plan、/do 特殊命令。
 func (m *Model) submitMessage(text string) (tea.Model, tea.Cmd) {
-	switch text {
-	case "/plan":
-		m.mode = permission.ModePlan
-		return m, tea.Println(renderNoticeBlock("已进入计划模式（只读工具，产出计划后请用 /do 执行）"))
-
-	case "/do":
-		m.mode = permission.ModeDefault
-		m.conv.AddUser(prompt.ExecuteDirective)
-		// fall through to start streaming
-
-	default:
-		m.conv.AddUser(text)
-	}
+	m.conv.AddUser(text)
 
 	// 启动 per-turn 上下文
 	turnCtx, turnCancel := context.WithCancel(context.Background())
 	m.turnCancel = turnCancel
 
-	a := agent.New(m.provider, m.registry, m.version, m.engine)
-	m.events = a.Run(turnCtx, m.conv, m.mode)
+	// 复用常驻 Agent 实例
+	m.events = m.ag.Run(turnCtx, m.conv, m.mode)
 	m.turnStart = time.Now()
 	m.curReply.Reset()
 	m.curTools = nil
@@ -481,6 +478,24 @@ func (m *Model) submitMessage(text string) (tea.Model, tea.Cmd) {
 }
 
 // Run 启动 TUI
+
+// startStreaming 开始流式处理（用于 /do 等已在 conv 添加 user 消息的场景）。
+func (m *Model) startStreaming() tea.Cmd {
+	turnCtx, turnCancel := context.WithCancel(context.Background())
+	m.turnCancel = turnCancel
+
+	m.events = m.ag.Run(turnCtx, m.conv, m.mode)
+	m.turnStart = time.Now()
+	m.curReply.Reset()
+	m.curTools = nil
+	m.iter = 0
+	m.state = stateStreaming
+
+	return tea.Batch(
+		waitForEvent(m.events),
+		m.spinner.Tick,
+	)
+}
 func (m *Model) Run() error {
 	p := tea.NewProgram(m)
 	_, err := p.Run()

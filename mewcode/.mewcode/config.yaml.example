@@ -9,6 +9,7 @@ providers:
     base_url: ""        # 留空使用默认端点
     api_key: "sk-ant-..."  # 替换为真实密钥
     thinking: true       # 启用扩展思考
+    context_window: 200000  # 可选，单位 token；未配置时按 protocol 默认（anthropic 200000、openai 128000）
 
   # - name: "OpenAI"
   #   protocol: "openai"
@@ -16,3 +17,4 @@ providers:
   #   base_url: ""        # 留空使用默认端点，或填兼容 API 地址
   #   api_key: "sk-..."    # 替换为真实密钥
   #   # thinking: false    # OpenAI 不生效
+  #   context_window: 128000  # 可选，未配置时按 protocol 默认

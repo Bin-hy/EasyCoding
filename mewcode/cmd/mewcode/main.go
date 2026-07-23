@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"mewcode/internal/agent"
+	"mewcode/internal/compact"
 	"mewcode/internal/config"
 	"mewcode/internal/mcp"
 	"mewcode/internal/permission"
@@ -56,8 +58,22 @@ func main() {
 		// eng 必非 nil，继续运行
 	}
 
-	// 启动 TUI（注入权限引擎）
-	m := tui.New(cfg.Providers, version, reg, eng)
+	// 构造会话级运行时状态
+	session, err := compact.NewSessionContext(root)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "会话初始化失败: %v\n", err)
+		os.Exit(1)
+	}
+	runtime := &agent.SessionRuntime{
+		Replacement:   compact.NewContentReplacementState(),
+		Recovery:      compact.NewRecoveryState(),
+		AutoTracking:  compact.NewAutoCompactTrackingState(),
+		Session:       session,
+		ContextWindow: cfg.Providers[0].EffectiveContextWindow(),
+	}
+
+	// 启动 TUI
+	m := tui.New(cfg.Providers, version, reg, eng, runtime)
 	if err := m.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "运行错误: %v\n", err)
 		os.Exit(1)
