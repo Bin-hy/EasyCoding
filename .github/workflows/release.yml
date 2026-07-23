@@ -7,14 +7,16 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 defaults:
   run:
     working-directory: mewcode
 
 jobs:
-  release:
-    name: Build & Release
+  # ───────────── 构建所有平台 ─────────────
+  build:
+    name: Build (${{ matrix.target.os }}/${{ matrix.target.arch }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -24,7 +26,6 @@ jobs:
           - { os: darwin,  arch: amd64 }
           - { os: darwin,  arch: arm64 }
           - { os: windows, arch: amd64 }
-
     steps:
       - uses: actions/checkout@v4
 
@@ -32,7 +33,6 @@ jobs:
         with:
           go-version-file: mewcode/go.mod
 
-      # ── 构建二进制 ──
       - name: Build
         env:
           CGO_ENABLED: 0
@@ -45,26 +45,46 @@ jobs:
           out="dist/mewcode-${GOOS}-${GOARCH}${suffix}"
           go build -ldflags="-s -w -X 'main.version=${GITHUB_REF_NAME#v}'" -o "$out" ./cmd/mewcode/
 
-      # ── 打包归档 ──
       - name: Package
+        env:
+          OS: ${{ matrix.target.os }}
+          ARCH: ${{ matrix.target.arch }}
         run: |
           cd dist
           suffix=""
-          [ "${{ matrix.target.os }}" = "windows" ] && suffix=".exe"
-          binary="mewcode-${{ matrix.target.os }}-${{ matrix.target.arch }}${suffix}"
-          archive="mewcode_${GITHUB_REF_NAME#v}_${{ matrix.target.os }}_${{ matrix.target.arch }}"
+          [ "$OS" = "windows" ] && suffix=".exe"
+          binary="mewcode-${OS}-${ARCH}${suffix}"
+          archive="mewcode_${GITHUB_REF_NAME#v}_${OS}_${ARCH}"
 
-          if [ "${{ matrix.target.os }}" = "windows" ]; then
-            zip  "${archive}.zip"  "$binary"
-            echo "asset=${archive}.zip" >> $GITHUB_ENV
+          if [ "$OS" = "windows" ]; then
+            zip "${archive}.zip" "$binary"
           else
             tar -czf "${archive}.tar.gz" "$binary"
-            echo "asset=${archive}.tar.gz" >> $GITHUB_ENV
           fi
 
-      # ── 上传到 Release ──
-      - name: Upload to Release
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.target.os }}-${{ matrix.target.arch }}
+          path: mewcode/dist/*
+          if-no-files-found: error
+
+  # ───────────── 汇总发布 ─────────────
+  publish:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: mewcode/dist/${{ env.asset }}
+          files: dist/*
           generate_release_notes: true
