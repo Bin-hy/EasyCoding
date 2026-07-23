@@ -2,6 +2,10 @@
 mewcode/.mewcode/config.yaml
 # MewCode 本地权限规则（含个人放行记录）
 mewcode/.mewcode/settings.local.yaml
+# MewCode 会话运行时目录（上下文管理落盘文件）
+mewcode/.mewcode/sessions/
+#构建产物
+dist/
 
 # ============ macOS 系统文件 ============
 .DS_Store

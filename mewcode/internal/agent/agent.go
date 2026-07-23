@@ -5,10 +5,14 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
+	"mewcode/internal/compact"
 	"mewcode/internal/conversation"
 	"mewcode/internal/llm"
 	"mewcode/internal/permission"
@@ -23,6 +27,24 @@ const (
 	PhaseStart Phase = iota // 工具开始执行
 	PhaseEnd                // 工具执行完毕
 )
+
+// CompactPhase 压缩生命周期阶段
+type CompactPhase int
+
+const (
+	CompactPhaseBeforeAuto      CompactPhase = iota + 1 // 自动压缩开始
+	CompactPhaseAfterAuto                               // 自动压缩完成
+	CompactPhaseBeforeEmergency                         // 紧急压缩开始
+	CompactPhaseAfterEmergency                          // 紧急压缩完成
+)
+
+// CompactEvent 压缩生命周期事件（兑现 spec F24a / F24b）
+type CompactEvent struct {
+	Phase  CompactPhase
+	Before int64
+	After  int64
+	Err    error
+}
 
 // ToolEvent 一次工具调用的开始/结束（供 TUI 渲染工具行与结果摘要）
 type ToolEvent struct {
@@ -59,6 +81,7 @@ type Event struct {
 	Done     bool             // 本轮（整个 Loop）结束
 	Err      error            // 出错（不中断会话）
 	Approval *ApprovalRequest // 非空：请求人在回路批准，消费者须回传 Respond 后再续读事件
+	Compact  *CompactEvent    // 压缩生命周期事件（非空时 TUI 优先渲染状态提示）
 }
 
 // Agent 持有 provider、注册中心与权限引擎，执行 ReAct 循环。
@@ -67,11 +90,20 @@ type Agent struct {
 	registry *tool.Registry
 	version  string             // 应用版本，供环境段采集
 	eng      *permission.Engine // 权限引擎（前四层判定 + 配置）
+	runtime  *SessionRuntime    // 跨 Run 复用的长生命周期状态
+	runMu    sync.Mutex         // 保证 Run 与 RunForceCompact 不并发
 }
 
-// New 创建 Agent。
-func New(p llm.Provider, r *tool.Registry, version string, eng *permission.Engine) *Agent {
-	return &Agent{provider: p, registry: r, version: version, eng: eng}
+// New 创建 Agent，支持可选 Option 注入。
+func New(p llm.Provider, r *tool.Registry, version string, eng *permission.Engine, opts ...Option) *Agent {
+	a := &Agent{provider: p, registry: r, version: version, eng: eng}
+	for _, opt := range opts {
+		opt(a)
+	}
+	if a.runtime == nil {
+		a.runtime = &SessionRuntime{ContextWindow: 200000}
+	}
+	return a
 }
 
 // 迭代与停止常量（内置，不可配）
@@ -96,27 +128,75 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode p
 	go func() {
 		defer close(ch)
 
+		a.runMu.Lock()
+		defer a.runMu.Unlock()
+
+		if a.runtime == nil {
+			a.runtime = &SessionRuntime{ContextWindow: 200000}
+		}
+
 		// 采集环境信息与装配稳定系统提示（Run 起始一次，跨轮复用）
 		env := prompt.GatherEnvironment(a.version, a.provider.Model())
 		sys := prompt.BuildSystemPrompt()
-
-		// 按 mode 取工具集
-		var defs []llm.ToolDefinition
-		if mode == permission.ModePlan {
-			defs = a.registry.ReadOnlyDefinitions()
-		} else {
-			defs = a.registry.Definitions()
-		}
-
 		envText := env.Render()
 		unknownRun := 0
 
 		for iter := 1; iter <= maxIterations; iter++ {
-			// 进度事件（F9）
+			emergencyRetried := false
+
+			// 进度事件
 			if !emit(ctx, ch, Event{Iter: iter}) {
 				finishCancelled(conv)
 				return
 			}
+
+			// 按 mode 取工具集
+			var defs []llm.ToolDefinition
+			if mode == permission.ModePlan {
+				defs = a.registry.ReadOnlyDefinitions()
+			} else {
+				defs = a.registry.Definitions()
+			}
+
+			// ---------- 上下文管理（ManageContext）----------
+			anchor, anchorLen := a.runtime.GetAnchor()
+			cw := a.runtime.ContextWindow
+			est := compact.EstimateTokens(anchor, conv.Messages(), anchorLen)
+
+			in := compact.ManageInput{
+				Conv:           conv,
+				Provider:       a.provider,
+				ContextWindow:  cw,
+				ToolDefs:       defs,
+				Replacement:    a.runtime.Replacement,
+				Recovery:       a.runtime.Recovery,
+				AutoTracking:   a.runtime.AutoTracking,
+				Session:        a.runtime.Session,
+				UsageAnchor:    anchor,
+				AnchorMsgLen:   anchorLen,
+				EstimatedToken: est,
+				Trigger:        compact.TriggerAuto,
+			}
+
+			// 判断是否需要自动压缩（预估超出阈值）
+			willSummarize := est >= int64(cw-compact.SummaryReserve-compact.AutoSafetyMargin)
+			if willSummarize {
+				emit(ctx, ch, Event{Compact: &CompactEvent{Phase: CompactPhaseBeforeAuto}})
+			}
+
+			out, mcErr := compact.ManageContext(ctx, in)
+
+			if willSummarize {
+				emit(ctx, ch, Event{Compact: &CompactEvent{
+					Phase: CompactPhaseAfterAuto, Before: out.BeforeTokens, After: out.AfterTokens, Err: mcErr,
+				}})
+			}
+			if mcErr != nil {
+				emit(ctx, ch, Event{Err: mcErr})
+				ensureAssistantTail(conv, noticeStreamErr)
+				return
+			}
+			// ---------- 上下文管理结束 ----------
 
 			// 按轮次计算规划模式 reminder
 			var reminder string
@@ -126,19 +206,57 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode p
 			}
 
 			// 流式请求本轮
-			text, calls, usage, ok := streamOnce(ctx, a.provider, conv.Messages(), defs, sys, envText, reminder, ch)
-			if !ok && ctx.Err() != nil {
-				// ctx 取消
+			text, calls, usage, sErr := streamOnce(ctx, a.provider, conv.Messages(), defs, sys, envText, reminder, ch)
+
+			// 紧急压缩处理
+			if sErr != nil && errors.Is(sErr, llm.ErrPromptTooLong) && !emergencyRetried {
+				out2, fErr := compact.ManageContext(ctx, compact.ManageInput{
+					Conv:           conv,
+					Provider:       a.provider,
+					ContextWindow:  cw,
+					ToolDefs:       defs,
+					Replacement:    a.runtime.Replacement,
+					Recovery:       a.runtime.Recovery,
+					AutoTracking:   a.runtime.AutoTracking,
+					Session:        a.runtime.Session,
+					UsageAnchor:    anchor,
+					AnchorMsgLen:   anchorLen,
+					EstimatedToken: est,
+					Trigger:        compact.TriggerEmergency,
+				})
+				_ = out2
+				if fErr != nil {
+					emit(ctx, ch, Event{Err: fErr})
+					ensureAssistantTail(conv, noticeStreamErr)
+					return
+				}
+				a.runtime.ResetAnchor()
+				est2 := compact.EstimateTokens(0, conv.Messages(), 0)
+				if est2 >= int64(cw-compact.ManualSafetyMargin) {
+					emit(ctx, ch, Event{Err: sErr})
+					ensureAssistantTail(conv, noticeStreamErr)
+					return
+				}
+				emergencyRetried = true
+				text, calls, usage, sErr = streamOnce(ctx, a.provider, conv.Messages(), defs, sys, envText, reminder, ch)
+			}
+
+			if sErr != nil && ctx.Err() != nil {
 				finishCancelled(conv)
 				return
 			}
-			if !ok {
-				// 流出错（Err 已在 streamOnce 内发出）
+			if sErr != nil {
+				emit(ctx, ch, Event{Err: sErr})
 				ensureAssistantTail(conv, noticeStreamErr)
 				return
 			}
 
-			// Usage 事件（含缓存字段 F4）
+			// 主对话路径完成后更新锚点
+			if usage != nil {
+				a.runtime.UpdateAnchor(compact.UsageAnchor(usage), conv.Len())
+			}
+
+			// Usage 事件
 			if usage != nil {
 				emit(ctx, ch, Event{Usage: &Usage{
 					Input:      usage.InputTokens,
@@ -148,7 +266,7 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode p
 				}})
 			}
 
-			// 无工具调用：自然完成（F2-1）
+			// 无工具调用：自然完成
 			if len(calls) == 0 {
 				final := ensureFinal(ch, text)
 				conv.AddAssistant(final)
@@ -166,10 +284,13 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode p
 				unknownRun = 0
 			}
 
-			// 保序分批并发执行（F5），含权限判定
+			// 保序分批并发执行（含权限判定 + ReadFile 追踪）
 			results, completed := a.executeBatched(ctx, calls, mode, ch)
 
-			// 无论是否取消都回灌工具结果（F6）
+			// 工具结果回灌前记录 ReadFile 追踪
+			a.recordFileReads(calls, results)
+
+			// 无论是否取消都回灌工具结果
 			conv.AddToolResults(results)
 
 			// 执行中被取消——最高优先级终止
@@ -178,7 +299,7 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode p
 				return
 			}
 
-			// 连续未知工具上限（F2-4）
+			// 连续未知工具上限
 			if unknownRun >= maxUnknownRun {
 				emit(ctx, ch, Event{Notice: noticeUnknownTools})
 				ensureAssistantTail(conv, noticeUnknownTools)
@@ -187,7 +308,7 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode p
 			}
 		}
 
-		// 触达迭代上限（F2-2）
+		// 触达迭代上限
 		emit(ctx, ch, Event{Notice: noticeMaxIter})
 		ensureAssistantTail(conv, noticeMaxIter)
 		emit(ctx, ch, Event{Done: true})
@@ -196,9 +317,75 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode p
 	return ch
 }
 
-// streamOnce 发起一次流式请求，将 Text 增量转发到 ch，返回累积的完整文本、工具调用列表、本轮用量。
-// 出错时返回 ok=false；ctx 取消也算不 ok。
-func streamOnce(ctx context.Context, provider llm.Provider, msgs []llm.Message, tools []llm.ToolDefinition, sys, envText, reminder string, ch chan<- Event) (text string, calls []llm.ToolCall, usage *llm.Usage, ok bool) {
+// RunForceCompact 供 TUI /compact 调用，在 Agent 空闲时执行手动压缩。
+func (a *Agent) RunForceCompact(ctx context.Context, conv *conversation.Conversation, defs []llm.ToolDefinition) (before, after int64, err error) {
+	a.runMu.Lock()
+	defer a.runMu.Unlock()
+
+	if a.runtime == nil {
+		a.runtime = &SessionRuntime{ContextWindow: 200000}
+	}
+
+	cw := a.runtime.ContextWindow
+	anchor, anchorLen := a.runtime.GetAnchor()
+	est := compact.EstimateTokens(anchor, conv.Messages(), anchorLen)
+
+	in := compact.ManageInput{
+		Conv:           conv,
+		Provider:       a.provider,
+		ContextWindow:  cw,
+		ToolDefs:       defs,
+		Replacement:    a.runtime.Replacement,
+		Recovery:       a.runtime.Recovery,
+		AutoTracking:   a.runtime.AutoTracking,
+		Session:        a.runtime.Session,
+		UsageAnchor:    anchor,
+		AnchorMsgLen:   anchorLen,
+		EstimatedToken: est,
+		Trigger:        compact.TriggerManual,
+	}
+
+	out, err := compact.ManageContext(ctx, in)
+	if err != nil {
+		return est, 0, err
+	}
+	return out.BeforeTokens, out.AfterTokens, nil
+}
+
+// recordFileReads 在工具结果回灌前记录 ReadFile 调用的纯净字节。
+func (a *Agent) recordFileReads(calls []llm.ToolCall, results []llm.ToolResult) {
+	if a.runtime == nil || a.runtime.Recovery == nil {
+		return
+	}
+	for i := range calls {
+		if calls[i].Name != "read_file" {
+			continue
+		}
+		if i >= len(results) || results[i].IsError {
+			continue
+		}
+		var args map[string]any
+		if err := json.Unmarshal(calls[i].Input, &args); err != nil {
+			continue
+		}
+		path, ok := args["path"].(string)
+		if !ok || path == "" {
+			continue
+		}
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			continue
+		}
+		b, err := os.ReadFile(absPath)
+		if err != nil {
+			continue
+		}
+		a.runtime.Recovery.RecordFile(absPath, string(b))
+	}
+}
+
+// streamOnce 发起一次流式请求，返回累积文本、工具调用列表、本轮用量和错误。
+func streamOnce(ctx context.Context, provider llm.Provider, msgs []llm.Message, tools []llm.ToolDefinition, sys, envText, reminder string, ch chan<- Event) (text string, calls []llm.ToolCall, usage *llm.Usage, err error) {
 	var textBuilder strings.Builder
 
 	req := llm.Request{
@@ -212,8 +399,7 @@ func streamOnce(ctx context.Context, provider llm.Provider, msgs []llm.Message, 
 	for ev := range stream {
 		switch {
 		case ev.Err != nil:
-			emit(ctx, ch, Event{Err: ev.Err})
-			return textBuilder.String(), calls, nil, false
+			return textBuilder.String(), calls, nil, ev.Err
 		case ev.Usage != nil:
 			usage = ev.Usage
 		case len(ev.ToolCalls) > 0:
@@ -221,17 +407,17 @@ func streamOnce(ctx context.Context, provider llm.Provider, msgs []llm.Message, 
 		case ev.Text != "":
 			textBuilder.WriteString(ev.Text)
 			if !emit(ctx, ch, Event{Text: ev.Text}) {
-				return textBuilder.String(), calls, nil, false
+				return textBuilder.String(), calls, nil, ctx.Err()
 			}
 		}
 	}
 
 	// ctx 取消则算失败
 	if ctx.Err() != nil {
-		return textBuilder.String(), calls, nil, false
+		return textBuilder.String(), calls, nil, ctx.Err()
 	}
 
-	return textBuilder.String(), calls, usage, true
+	return textBuilder.String(), calls, usage, nil
 }
 
 // executeBatched 保序分批并发执行工具调用（F5），含权限判定（F6）。
@@ -269,7 +455,6 @@ func (a *Agent) executeBatched(ctx context.Context, calls []llm.ToolCall, mode p
 				if d == permission.Deny {
 					preDenied[k] = reason
 				}
-				// 只读永不 Ask（N3），无需处理 Ask 分支
 			}
 
 			// 先按序 emit 所有 Start 事件
@@ -280,7 +465,6 @@ func (a *Agent) executeBatched(ctx context.Context, calls []llm.ToolCall, mode p
 					Args:  argsPreview,
 					Phase: PhaseStart,
 				}}) {
-					// ctx 已取消，补齐剩余结果
 					for m := k; m < len(calls); m++ {
 						if results[m].ToolCallID == "" {
 							results[m] = llm.ToolResult{
@@ -309,7 +493,7 @@ func (a *Agent) executeBatched(ctx context.Context, calls []llm.ToolCall, mode p
 			var wg sync.WaitGroup
 			for k := i; k < j; k++ {
 				if _, denied := preDenied[k]; denied {
-					continue // 跳过被拒项
+					continue
 				}
 				wg.Add(1)
 				go func(idx int) {
@@ -339,7 +523,6 @@ func (a *Agent) executeBatched(ctx context.Context, calls []llm.ToolCall, mode p
 					Result:  resultSummary,
 					IsError: result.IsError,
 				}}) {
-					// ctx 已取消
 					for m := j; m < len(calls); m++ {
 						if results[m].ToolCallID == "" {
 							results[m] = llm.ToolResult{
@@ -363,7 +546,6 @@ func (a *Agent) executeBatched(ctx context.Context, calls []llm.ToolCall, mode p
 
 			switch d {
 			case permission.Deny:
-				// Start + End 事件（错误）
 				if !emit(ctx, ch, Event{Tool: &ToolEvent{
 					Name:  call.Name,
 					Args:  argsPreview,
@@ -408,10 +590,8 @@ func (a *Agent) executeBatched(ctx context.Context, calls []llm.ToolCall, mode p
 				i++
 
 			case permission.Ask:
-				// 第五层：人在回路
 				outcome, ok2 := a.requestApproval(ctx, call, reason, ch)
 				if !ok2 {
-					// ctx 取消
 					for m := i; m < len(calls); m++ {
 						if results[m].ToolCallID == "" {
 							results[m] = llm.ToolResult{
@@ -434,15 +614,11 @@ func (a *Agent) executeBatched(ctx context.Context, calls []llm.ToolCall, mode p
 
 				case permission.OutcomeAllowOnce, permission.OutcomeAllowForever:
 					if outcome == permission.OutcomeAllowForever {
-						// 永久放行：写本地配置
 						if err := a.eng.PersistLocalAllow(call); err != nil {
-							// 仅记录，不阻断执行
 							emit(ctx, ch, Event{Notice: fmt.Sprintf("（写入本地规则失败: %v）", err)})
 						}
 					}
 
-					// 执行工具
-					// Start 事件
 					if !emit(ctx, ch, Event{Tool: &ToolEvent{
 						Name:  call.Name,
 						Args:  argsPreview,
@@ -470,7 +646,6 @@ func (a *Agent) executeBatched(ctx context.Context, calls []llm.ToolCall, mode p
 						IsError:    result.IsError,
 					}
 
-					// End 事件
 					resultSummary := argPreview(json.RawMessage(result.Content))
 					resultSummary = truncateLines(resultSummary, 8)
 					if !emit(ctx, ch, Event{Tool: &ToolEvent{
@@ -495,8 +670,6 @@ func (a *Agent) executeBatched(ctx context.Context, calls []llm.ToolCall, mode p
 				i++
 
 			case permission.Allow:
-				// 直接执行
-				// Start 事件
 				if !emit(ctx, ch, Event{Tool: &ToolEvent{
 					Name:  call.Name,
 					Args:  argsPreview,
@@ -524,7 +697,6 @@ func (a *Agent) executeBatched(ctx context.Context, calls []llm.ToolCall, mode p
 					IsError:    result.IsError,
 				}
 
-				// End 事件
 				resultSummary := argPreview(json.RawMessage(result.Content))
 				resultSummary = truncateLines(resultSummary, 8)
 				if !emit(ctx, ch, Event{Tool: &ToolEvent{
@@ -550,7 +722,6 @@ func (a *Agent) executeBatched(ctx context.Context, calls []llm.ToolCall, mode p
 		}
 	}
 
-	// 即使所有工具执行完成，若 ctx 已取消则报 incomplete
 	if ctx.Err() != nil {
 		for k := i; k < len(calls); k++ {
 			if results[k].ToolCallID == "" {
@@ -568,7 +739,6 @@ func (a *Agent) executeBatched(ctx context.Context, calls []llm.ToolCall, mode p
 }
 
 // requestApproval 发送人在回路待批准请求，阻塞等待 TUI 回传决策。
-// 返回 (Outcome, true) 表示收到决策；(0, false) 表示 ctx 已取消。
 func (a *Agent) requestApproval(ctx context.Context, call llm.ToolCall, reason string, ch chan<- Event) (permission.Outcome, bool) {
 	respond := make(chan permission.Outcome, 1)
 	req := &ApprovalRequest{
@@ -599,7 +769,7 @@ func emit(ctx context.Context, ch chan<- Event, e Event) bool {
 	}
 }
 
-// allUnknown 判断所有调用是否都请求了注册中心不存在的工具。空列表返回 false。
+// allUnknown 判断所有调用是否都请求了注册中心不存在的工具。
 func allUnknown(registry *tool.Registry, calls []llm.ToolCall) bool {
 	if len(calls) == 0 {
 		return false
@@ -612,7 +782,7 @@ func allUnknown(registry *tool.Registry, calls []llm.ToolCall) bool {
 	return true
 }
 
-// ensureFinal 确保最终文本非空；为空时返回占位文本（避免空 assistant 回合破坏下一轮请求）。
+// ensureFinal 确保最终文本非空。
 func ensureFinal(ch chan<- Event, text string) string {
 	if text != "" {
 		return text
@@ -626,7 +796,6 @@ func ensureFinal(ch chan<- Event, text string) string {
 }
 
 // ensureAssistantTail 若历史末尾不是 assistant 角色，补一条兜底文本。
-// 确保取消/出错/上限后角色仍交替，下一轮请求不报 400（F6）。
 func ensureAssistantTail(conv *conversation.Conversation, fallback string) {
 	if conv.LastRole() != llm.RoleAssistant {
 		conv.AddAssistant(fallback)

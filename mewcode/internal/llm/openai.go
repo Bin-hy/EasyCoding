@@ -3,6 +3,8 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strings"
 
 	openai "github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
@@ -160,7 +162,7 @@ func (p *openaiProvider) Stream(ctx context.Context, req Request) <-chan StreamE
 		// 流结束或出错
 		if err := stream.Err(); err != nil {
 			select {
-			case ch <- StreamEvent{Err: err}:
+			case ch <- StreamEvent{Err: wrapOpenAIPTL(err)}:
 			case <-ctx.Done():
 			}
 			return
@@ -210,4 +212,19 @@ func (p *openaiProvider) Stream(ctx context.Context, req Request) <-chan StreamE
 	}()
 
 	return ch
+}
+
+// wrapOpenAIPTL 检测 OpenAI 上下文过长错误并包装为 ErrPromptTooLong。
+func wrapOpenAIPTL(err error) error {
+	if err == nil {
+		return nil
+	}
+	errStr := err.Error()
+	if strings.Contains(errStr, "context_length_exceeded") ||
+		strings.Contains(errStr, "maximum context length") ||
+		strings.Contains(errStr, "too long") ||
+		strings.Contains(errStr, "token") && strings.Contains(errStr, "exceed") {
+		return fmt.Errorf("%w: %v", ErrPromptTooLong, err)
+	}
+	return err
 }

@@ -3,10 +3,14 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"mewcode/internal/config"
 )
+
+// ErrPromptTooLong 表示请求上下文超出 provider 窗口上限。
+var ErrPromptTooLong = errors.New("prompt too long for context window")
 
 // 消息角色常量
 const (
@@ -93,9 +97,9 @@ type Provider interface {
 // New 按 protocol 构造对应的适配器
 func New(cfg config.ProviderConfig) (Provider, error) {
 	switch cfg.Protocol {
-	case "anthropic":
+	case config.ProtocolAnthropic:
 		return newAnthropicProvider(cfg)
-	case "openai":
+	case config.ProtocolOpenAI:
 		return newOpenAIProvider(cfg)
 	default:
 		return nil, fmt.Errorf("不支持的协议类型: %s", cfg.Protocol)

@@ -3,6 +3,8 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strings"
 
 	anthropic "github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -193,7 +195,7 @@ func (p *anthropicProvider) Stream(ctx context.Context, req Request) <-chan Stre
 			// Accumulate 处理所有事件（文本、thinking、tool_use 等）
 			if err := acc.Accumulate(event); err != nil {
 				select {
-				case ch <- StreamEvent{Err: err}:
+				case ch <- StreamEvent{Err: wrapAnthropicPTL(err)}:
 				case <-ctx.Done():
 					return
 				}
@@ -217,7 +219,7 @@ func (p *anthropicProvider) Stream(ctx context.Context, req Request) <-chan Stre
 		// 流结束或出错
 		if err := stream.Err(); err != nil {
 			select {
-			case ch <- StreamEvent{Err: err}:
+			case ch <- StreamEvent{Err: wrapAnthropicPTL(err)}:
 			case <-ctx.Done():
 			}
 			return
@@ -266,4 +268,18 @@ func (p *anthropicProvider) Stream(ctx context.Context, req Request) <-chan Stre
 	}()
 
 	return ch
+}
+
+// wrapAnthropicPTL 检测 Anthropic 上下文过长错误并包装为 ErrPromptTooLong。
+func wrapAnthropicPTL(err error) error {
+	if err == nil {
+		return nil
+	}
+	errStr := err.Error()
+	if strings.Contains(errStr, "prompt is too long") ||
+		strings.Contains(errStr, "context_length") ||
+		strings.Contains(errStr, "too many tokens") {
+		return fmt.Errorf("%w: %v", ErrPromptTooLong, err)
+	}
+	return err
 }
