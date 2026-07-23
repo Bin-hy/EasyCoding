@@ -123,7 +123,7 @@ func NewManager(ctx context.Context, cfg Config, version string) *Manager {
 			lst, err := cs.ListTools(ctx2, nil)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "[mcp] warn: list tools for server %s failed: %v\n", name, err)
-				cs.Close() // 释放连接
+				_ = cs.Close() // 释放连接
 				return
 			}
 
@@ -182,7 +182,7 @@ func (m *Manager) Close() {
 		wg.Add(1)
 		go func(cs *sdkmcp.ClientSession) {
 			defer wg.Done()
-			cs.Close()
+			_ = cs.Close()
 		}(s.cs)
 	}
 

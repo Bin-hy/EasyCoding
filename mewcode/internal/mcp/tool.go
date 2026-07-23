@@ -126,9 +126,9 @@ func adaptTool(serverName string, t *sdkmcp.Tool, cs callerSession) (*mcpTool, b
 	var schema map[string]any
 	if t.InputSchema != nil {
 		b, _ := json.Marshal(t.InputSchema)
-		json.Unmarshal(b, &schema)
+		_ = json.Unmarshal(b, &schema)
 	}
-	if schema == nil || len(schema) == 0 {
+	if len(schema) == 0 {
 		schema = map[string]any{"type": "object"}
 	}
 

@@ -144,7 +144,7 @@ func (t *grepTool) Execute(ctx context.Context, args json.RawMessage) Result {
 
 	var out strings.Builder
 	for _, m := range matches {
-		out.WriteString(fmt.Sprintf("%s:%d: %s\n", m.file, m.lineNum, m.content))
+		fmt.Fprintf(&out, "%s:%d: %s\n", m.file, m.lineNum, m.content)
 	}
 	if len(matches) >= maxResults {
 		out.WriteString("[truncated]\n")
@@ -164,7 +164,7 @@ func grepFile(re *regexp.Regexp, path, relPath string, longLineWarned *bool, max
 	if err != nil {
 		return nil
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	scanner := bufio.NewScanner(f)
 	// 设置 1MB 缓冲区限制，超出则标注

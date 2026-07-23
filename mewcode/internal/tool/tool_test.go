@@ -77,7 +77,7 @@ func TestReadFile_Exists(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.txt")
 	content := "line1\nline2\nline3"
-	os.WriteFile(path, []byte(content), 0o644)
+	_ = os.WriteFile(path, []byte(content), 0o644)
 
 	tool := &readFileTool{}
 	args, _ := json.Marshal(readFileArgs{Path: path})
@@ -174,7 +174,7 @@ func TestWriteFile_NestedPath(t *testing.T) {
 func TestWriteFile_Overwrite(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "overwrite.txt")
-	os.WriteFile(path, []byte("old"), 0o644)
+	_ = os.WriteFile(path, []byte("old"), 0o644)
 
 	tool := &writeFileTool{}
 	args, _ := json.Marshal(writeFileArgs{Path: path, Content: "new content"})
@@ -196,7 +196,7 @@ func TestWriteFile_Overwrite(t *testing.T) {
 func TestEditFile_UniqueMatch(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "edit.txt")
-	os.WriteFile(path, []byte("hello world"), 0o644)
+	_ = os.WriteFile(path, []byte("hello world"), 0o644)
 
 	tool := &editFileTool{}
 	args, _ := json.Marshal(editFileArgs{FilePath: path, OldStr: "hello", NewStr: "hi"})
@@ -215,7 +215,7 @@ func TestEditFile_UniqueMatch(t *testing.T) {
 func TestEditFile_NoMatch(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "edit.txt")
-	os.WriteFile(path, []byte("hello world"), 0o644)
+	_ = os.WriteFile(path, []byte("hello world"), 0o644)
 
 	tool := &editFileTool{}
 	args, _ := json.Marshal(editFileArgs{FilePath: path, OldStr: "nonexistent", NewStr: "x"})
@@ -232,7 +232,7 @@ func TestEditFile_NoMatch(t *testing.T) {
 func TestEditFile_MultipleMatch(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "edit.txt")
-	os.WriteFile(path, []byte("hello hello world"), 0o644)
+	_ = os.WriteFile(path, []byte("hello hello world"), 0o644)
 
 	tool := &editFileTool{}
 	args, _ := json.Marshal(editFileArgs{FilePath: path, OldStr: "hello", NewStr: "hi"})
@@ -309,11 +309,11 @@ func TestBash_NonZeroExit(t *testing.T) {
 
 func TestGlob_GoFiles(t *testing.T) {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "a.go"), []byte("package main"), 0o644)
-	os.WriteFile(filepath.Join(dir, "b.go"), []byte("package main"), 0o644)
-	os.WriteFile(filepath.Join(dir, "c.txt"), []byte("text"), 0o644)
-	os.MkdirAll(filepath.Join(dir, "sub"), 0o755)
-	os.WriteFile(filepath.Join(dir, "sub", "d.go"), []byte("package sub"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "a.go"), []byte("package main"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "b.go"), []byte("package main"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "c.txt"), []byte("text"), 0o644)
+	_ = os.MkdirAll(filepath.Join(dir, "sub"), 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "sub", "d.go"), []byte("package sub"), 0o644)
 
 	tool := &globTool{}
 	args, _ := json.Marshal(globArgs{Pattern: "**/*.go", Path: dir})
@@ -357,8 +357,8 @@ func TestGlob_NoMatch(t *testing.T) {
 
 func TestGrep_Match(t *testing.T) {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "a.go"), []byte("package main\nimport \"fmt\"\nfunc main() {\n\tfmt.Println(\"hello\")\n}\n"), 0o644)
-	os.WriteFile(filepath.Join(dir, "b.txt"), []byte("nothing here"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "a.go"), []byte("package main\nimport \"fmt\"\nfunc main() {\n\tfmt.Println(\"hello\")\n}\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "b.txt"), []byte("nothing here"), 0o644)
 
 	tool := &grepTool{}
 	args, _ := json.Marshal(grepArgs{Pattern: "Println", Path: dir})
@@ -377,7 +377,7 @@ func TestGrep_Match(t *testing.T) {
 
 func TestGrep_NoMatch(t *testing.T) {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "test.txt"), []byte("hello"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "test.txt"), []byte("hello"), 0o644)
 
 	tool := &grepTool{}
 	args, _ := json.Marshal(grepArgs{Pattern: "zzzzNOTFOUNDzzzz", Path: dir})

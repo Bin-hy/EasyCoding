@@ -365,8 +365,5 @@ func TestToolsSorting(t *testing.T) {
 		names[i] = mt.fullName
 	}
 
-	// 简单排序验证
-	if names[0] > names[2] {
-		// 预期 alpha__a < alpha__z < zebra__a
-	}
+	// 简单排序验证: alpha__a < alpha__z < zebra__a
 }

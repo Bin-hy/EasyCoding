@@ -94,7 +94,8 @@ func matchCommandPattern(pattern, target string) bool {
 
 	pi, ti := 0, 0
 	for pi < len(pattern) && ti < len(target) {
-		if pattern[pi] == '*' {
+		switch pattern[pi] {
+		case '*':
 			// * 匹配剩余全部
 			if pi == len(pattern)-1 {
 				return true
@@ -108,10 +109,10 @@ func matchCommandPattern(pattern, target string) bool {
 			if ti >= len(target) {
 				return false
 			}
-		} else if pattern[pi] == target[ti] {
+		case target[ti]:
 			pi++
 			ti++
-		} else {
+		default:
 			return false
 		}
 	}

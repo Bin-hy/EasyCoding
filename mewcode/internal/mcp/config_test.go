@@ -17,10 +17,10 @@ func captureStderr(f func()) string {
 	defer func() { os.Stderr = orig }()
 
 	f()
-	w.Close()
+	_ = w.Close()
 
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	_, _ = buf.ReadFrom(r)
 	return buf.String()
 }
 
@@ -77,8 +77,8 @@ mcp_servers:
 // ---- expandVars 单测 ----
 
 func TestExpandVars_Defined(t *testing.T) {
-	os.Setenv("TEST_MCP_VAR", "hello_value")
-	defer os.Unsetenv("TEST_MCP_VAR")
+	_ = os.Setenv("TEST_MCP_VAR", "hello_value")
+	defer func() { _ = os.Unsetenv("TEST_MCP_VAR") }()
 
 	out, undefined := expandVars("prefix_${TEST_MCP_VAR}_suffix")
 	if out != "prefix_hello_value_suffix" {
@@ -100,10 +100,9 @@ func TestExpandVars_Undefined(t *testing.T) {
 }
 
 func TestExpandVars_MultipleVars(t *testing.T) {
-	os.Setenv("A", "1")
-	os.Setenv("B", "2")
-	defer os.Unsetenv("A")
-	defer os.Unsetenv("B")
+	_ = os.Setenv("A", "1")
+	_ = os.Setenv("B", "2")
+	defer func() { _ = os.Unsetenv("A"); _ = os.Unsetenv("B") }()
 
 	out, undefined := expandVars("${A}_${B}_${C}")
 	if out != "1_2_" {
@@ -275,7 +274,7 @@ func TestLoadConfig_UserOnly(t *testing.T) {
 	// 用临时 HOME 覆盖
 	homeDir := t.TempDir()
 	mewcodeDir := filepath.Join(homeDir, ".mewcode")
-	os.MkdirAll(mewcodeDir, 0755)
+	_ = os.MkdirAll(mewcodeDir, 0755)
 	writeTempYAML(t, mewcodeDir, "config.yaml", `
 mcp_servers:
   gh:
@@ -317,7 +316,7 @@ func TestLoadConfig_MergeOverride(t *testing.T) {
 	// 用户级: shared 用 user-cmd
 	homeDir := t.TempDir()
 	mewcodeDir := filepath.Join(homeDir, ".mewcode")
-	os.MkdirAll(mewcodeDir, 0755)
+	_ = os.MkdirAll(mewcodeDir, 0755)
 	writeTempYAML(t, mewcodeDir, "config.yaml", `
 mcp_servers:
   shared:
@@ -385,10 +384,9 @@ func TestLoadConfig_InvalidFileDegrade(t *testing.T) {
 }
 
 func TestLoadConfig_EnvVarExpansion(t *testing.T) {
-	os.Setenv("MY_TOKEN", "secret123")
-	os.Setenv("MY_KEY", "key456")
-	defer os.Unsetenv("MY_TOKEN")
-	defer os.Unsetenv("MY_KEY")
+	_ = os.Setenv("MY_TOKEN", "secret123")
+	_ = os.Setenv("MY_KEY", "key456")
+	defer func() { _ = os.Unsetenv("MY_TOKEN"); _ = os.Unsetenv("MY_KEY") }()
 
 	dir := t.TempDir()
 	writeTempYAML(t, dir, ".mewcode.yaml", `
@@ -416,8 +414,8 @@ mcp_servers:
 }
 
 func TestLoadConfig_CommandNotExpanded(t *testing.T) {
-	os.Setenv("CMD", "malicious_cmd")
-	defer os.Unsetenv("CMD")
+	_ = os.Setenv("CMD", "malicious_cmd")
+	defer func() { _ = os.Unsetenv("CMD") }()
 
 	dir := t.TempDir()
 	writeTempYAML(t, dir, ".mewcode.yaml", `

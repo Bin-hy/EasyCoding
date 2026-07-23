@@ -47,10 +47,10 @@ func (d providerDelegate) Render(w io.Writer, m list.Model, index int, item list
 			Foreground(lipgloss.Color("#FFFFFF")).
 			Background(lipgloss.Color("#5555FF")).
 			Padding(0, 1)
-		fmt.Fprint(w, selectedStyle.Render(title))
+		_, _ = fmt.Fprint(w, selectedStyle.Render(title))
 	} else {
 		normalStyle := lipgloss.NewStyle().Padding(0, 1)
-		fmt.Fprint(w, normalStyle.Render(title))
+		_, _ = fmt.Fprint(w, normalStyle.Render(title))
 	}
 }
 

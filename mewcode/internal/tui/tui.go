@@ -57,7 +57,6 @@ type Model struct {
 	engine    *permission.Engine // 权限引擎
 
 	// 流式状态
-	ctx        context.Context
 	cancel     context.CancelFunc // 程序级取消（idle 时 Ctrl+C 退出）
 	turnCancel context.CancelFunc // 本轮取消（streaming 时 Esc/Ctrl+C）
 	events     <-chan agent.Event
@@ -447,12 +446,12 @@ func (m *Model) handleIdleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 // submitMessage 提交用户消息并通过 agent 发起流式请求。
 // 识别 /plan、/do 特殊命令。
 func (m *Model) submitMessage(text string) (tea.Model, tea.Cmd) {
-	switch {
-	case text == "/plan":
+	switch text {
+	case "/plan":
 		m.mode = permission.ModePlan
 		return m, tea.Println(renderNoticeBlock("已进入计划模式（只读工具，产出计划后请用 /do 执行）"))
 
-	case text == "/do":
+	case "/do":
 		m.mode = permission.ModeDefault
 		m.conv.AddUser(prompt.ExecuteDirective)
 		// fall through to start streaming

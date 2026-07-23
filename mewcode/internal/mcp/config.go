@@ -154,14 +154,7 @@ func validateServer(name string, srv rawServer) (ServerConfig, bool) {
 		return ServerConfig{}, false
 	}
 
-	return ServerConfig{
-		Type:    srv.Type,
-		Command: srv.Command,
-		Args:    srv.Args,
-		Env:     srv.Env,
-		URL:     srv.URL,
-		Headers: srv.Headers,
-	}, true
+	return ServerConfig(srv), true
 }
 
 // LoadConfig 加载并合并用户级与项目级两层 MCP 配置。
