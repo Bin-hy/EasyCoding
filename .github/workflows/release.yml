@@ -9,15 +9,14 @@ permissions:
   contents: write
   actions: read
 
-defaults:
-  run:
-    working-directory: mewcode
-
 jobs:
   # ───────────── 构建所有平台 ─────────────
   build:
     name: Build (${{ matrix.target.os }}/${{ matrix.target.arch }})
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mewcode
     strategy:
       matrix:
         target:
