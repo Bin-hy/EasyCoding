@@ -11,10 +11,12 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"mewcode/internal/compact"
 	"mewcode/internal/conversation"
 	"mewcode/internal/llm"
+	"mewcode/internal/memory"
 	"mewcode/internal/permission"
 	"mewcode/internal/prompt"
 	"mewcode/internal/tool"
@@ -86,12 +88,21 @@ type Event struct {
 
 // Agent 持有 provider、注册中心与权限引擎，执行 ReAct 循环。
 type Agent struct {
-	provider llm.Provider
-	registry *tool.Registry
-	version  string             // 应用版本，供环境段采集
-	eng      *permission.Engine // 权限引擎（前四层判定 + 配置）
-	runtime  *SessionRuntime    // 跨 Run 复用的长生命周期状态
-	runMu    sync.Mutex         // 保证 Run 与 RunForceCompact 不并发
+	provider        llm.Provider
+	registry        *tool.Registry
+	version         string             // 应用版本，供环境段采集
+	eng             *permission.Engine // 权限引擎（前四层判定 + 配置）
+	runtime         *SessionRuntime    // 跨 Run 复用的长生命周期状态
+	memMgr          *memory.Manager    // 可选：记忆更新管理器
+	instructionText string             // 项目指令文本（注入系统提示）
+	memoryText      string             // 记忆索引文本（注入系统提示）
+	runMu           sync.Mutex         // 保证 Run 与 RunForceCompact 不并发
+	running         int32              // 原子标记：是否正在执行 Run
+}
+
+// IsRunning 返回 Agent 当前是否正在执行 Run。
+func (a *Agent) IsRunning() bool {
+	return atomic.LoadInt32(&a.running) == 1
 }
 
 // New 创建 Agent，支持可选 Option 注入。
@@ -128,6 +139,9 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode p
 	go func() {
 		defer close(ch)
 
+		atomic.StoreInt32(&a.running, 1)
+		defer atomic.StoreInt32(&a.running, 0)
+
 		a.runMu.Lock()
 		defer a.runMu.Unlock()
 
@@ -137,7 +151,7 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode p
 
 		// 采集环境信息与装配稳定系统提示（Run 起始一次，跨轮复用）
 		env := prompt.GatherEnvironment(a.version, a.provider.Model())
-		sys := prompt.BuildSystemPrompt()
+		sys := prompt.BuildSystemPrompt(a.instructionText, a.memoryText)
 		envText := env.Render()
 		unknownRun := 0
 
@@ -270,6 +284,16 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode p
 			if len(calls) == 0 {
 				final := ensureFinal(ch, text)
 				conv.AddAssistant(final)
+
+				// 记忆更新触发（每 5 轮或显式请求）
+				if a.memMgr != nil && a.runtime != nil {
+					turnCount := a.runtime.IncTurn()
+					recentMsgs := extractRecentTurn(conv)
+					if turnCount%5 == 0 || hasMemorySignal(recentMsgs) {
+						a.memMgr.UpdateAsync(ctx, recentMsgs)
+					}
+				}
+
 				emit(ctx, ch, Event{Done: true})
 				return
 			}
@@ -841,4 +865,36 @@ func truncateLines(s string, n int) string {
 		return strings.Join(lines, "\n") + "\n..."
 	}
 	return s
+}
+
+// extractRecentTurn 从对话历史中提取最近一轮的消息。
+func extractRecentTurn(conv *conversation.Conversation) []llm.Message {
+	msgs := conv.Messages()
+	// 从后往前找最后一条 user 消息
+	var startIdx int
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role == llm.RoleUser {
+			startIdx = i
+			break
+		}
+	}
+	return msgs[startIdx:]
+}
+
+// memorySignalKeywords 显式记忆请求关键词。
+var memorySignalKeywords = []string{"记住", "记忆", "别忘", "remember", "memo"}
+
+// hasMemorySignal 检查最近消息中是否包含显式记忆请求关键词。
+func hasMemorySignal(msgs []llm.Message) bool {
+	for _, msg := range msgs {
+		if msg.Role == llm.RoleUser {
+			lower := strings.ToLower(msg.Content)
+			for _, kw := range memorySignalKeywords {
+				if strings.Contains(lower, kw) {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }

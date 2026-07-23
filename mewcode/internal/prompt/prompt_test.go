@@ -41,7 +41,7 @@ func TestAssembleSystem_SkipEmpty(t *testing.T) {
 }
 
 func TestBuildSystemPrompt_NotEmpty(t *testing.T) {
-	result := BuildSystemPrompt()
+	result := BuildSystemPrompt("", "")
 	if result == "" {
 		t.Fatal("BuildSystemPrompt returned empty string")
 	}
@@ -56,8 +56,8 @@ func TestBuildSystemPrompt_NotEmpty(t *testing.T) {
 
 // N1 缓存确定性：连续两次 BuildSystemPrompt 逐字节相等。
 func TestBuildSystemPrompt_Deterministic(t *testing.T) {
-	a := BuildSystemPrompt()
-	b := BuildSystemPrompt()
+	a := BuildSystemPrompt("", "")
+	b := BuildSystemPrompt("", "")
 	if a != b {
 		t.Fatal("BuildSystemPrompt must be deterministic across calls (N1 cache stability)")
 	}
@@ -65,7 +65,7 @@ func TestBuildSystemPrompt_Deterministic(t *testing.T) {
 
 // 验证可选空槽：BuildSystemPrompt 中三个可选模块内容为空，不出现对应占位。
 func TestBuildSystemPrompt_OptionalSlotsEmpty(t *testing.T) {
-	result := BuildSystemPrompt()
+	result := BuildSystemPrompt("", "")
 	// 可选槽为空，不应出现槽位名称或标记
 	for _, slot := range []string{"自定义指令", "已激活 Skill", "长期记忆"} {
 		if strings.Contains(result, slot) {
@@ -76,7 +76,7 @@ func TestBuildSystemPrompt_OptionalSlotsEmpty(t *testing.T) {
 
 // F5 双重强化：系统提示中包含关键约定——优先用专用工具、编辑前必先读。
 func TestBuildSystemPrompt_DoubleReinforcement(t *testing.T) {
-	result := BuildSystemPrompt()
+	result := BuildSystemPrompt("", "")
 	// 专用工具优先
 	if !strings.Contains(result, "read_file") || !strings.Contains(result, "glob") || !strings.Contains(result, "grep") {
 		t.Error("BuildSystemPrompt should mention read_file/glob/grep for tool priority")

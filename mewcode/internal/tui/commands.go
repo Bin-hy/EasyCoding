@@ -14,12 +14,13 @@ import (
 // commandHandler 命令处理器签名。
 type commandHandler func(ctx context.Context, model *Model) tea.Cmd
 
-// builtinCommands 注册表：/exit /plan /do /compact。
+// builtinCommands 注册表：/exit /plan /do /compact /resume。
 var builtinCommands = map[string]commandHandler{
 	"/exit":    handleExit,
 	"/plan":    handlePlan,
 	"/do":      handleDo,
 	"/compact": handleCompact,
+	"/resume":  handleResume,
 }
 
 // dispatchCommand 检查输入是否以 / 开头，命中则返回对应处理器。
@@ -71,8 +72,19 @@ func handleCompact(ctx context.Context, model *Model) tea.Cmd {
 	return tea.Println(renderNoticeBlock(fmt.Sprintf("已压缩，token 从 %d 降至 %d", before, after)))
 }
 
+// handleResume 进入会话恢复列表。仅在 idle 状态下可用。
+func handleResume(ctx context.Context, model *Model) tea.Cmd {
+	if model.state != stateIdle {
+		return tea.Println(renderNoticeBlock("请等待当前任务完成后再恢复会话"))
+	}
+	if model.ag != nil && model.ag.IsRunning() {
+		return tea.Println(renderNoticeBlock("请等待当前任务完成后再恢复会话"))
+	}
+	return model.beginResume()
+}
+
 func handleUnknown(ctx context.Context, model *Model) tea.Cmd {
-	return tea.Println(renderNoticeBlock("未知命令，可用命令: /exit /plan /do /compact"))
+	return tea.Println(renderNoticeBlock("未知命令，可用命令: /exit /plan /do /compact /resume"))
 }
 
 // formatCompactNotice 将 CompactEvent 格式化为 TUI 展示文案。

@@ -25,10 +25,12 @@ func AssembleSystem(mods []Module) string {
 	return strings.Join(parts, "\n\n")
 }
 
-// BuildSystemPrompt 返回完整的稳定系统提示：固定七模块 + 可选三空槽拼接。
+// BuildSystemPrompt 返回完整的稳定系统提示。
+// instructions 非空时填入 custom-instructions 模块（priority 80）。
+// memory 非空时填入 long-term-memory 模块（priority 100）。
 // 可选槽 Content 为空时自动跳过，不留多余空行。
-func BuildSystemPrompt() string {
-	all := append(FixedModules(), OptionalModules()...)
+func BuildSystemPrompt(instructions, memory string) string {
+	all := append(FixedModules(), OptionalModules(instructions, memory)...)
 	return AssembleSystem(all)
 }
 
