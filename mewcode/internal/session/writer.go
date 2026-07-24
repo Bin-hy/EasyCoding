@@ -12,8 +12,8 @@ import (
 
 // Entry 是 JSONL 中一行的结构。
 type Entry struct {
-	Type        string           `json:"type,omitempty"`         // "compact" 或空
-	Role        string           `json:"role,omitempty"`         // "user" / "assistant" / "tool"
+	Type        string           `json:"type,omitempty"` // "compact" 或空
+	Role        string           `json:"role,omitempty"` // "user" / "assistant" / "tool"
 	Content     string           `json:"content,omitempty"`
 	ToolCalls   []llm.ToolCall   `json:"tool_calls,omitempty"`
 	ToolResults []llm.ToolResult `json:"tool_results,omitempty"`
@@ -26,7 +26,11 @@ type Writer struct {
 	mu   sync.Mutex
 	file *os.File
 	enc  *json.Encoder
+	path string // JSONL 文件的绝对路径
 }
+
+// Path 返回 JSONL 文件的绝对路径。
+func (w *Writer) Path() string { return w.path }
 
 // NewWriter 在 sessionDir 下创建/打开 conversation.jsonl 用于追加写入。
 func NewWriter(sessionDir string) (*Writer, error) {
@@ -41,6 +45,7 @@ func NewWriter(sessionDir string) (*Writer, error) {
 	return &Writer{
 		file: f,
 		enc:  json.NewEncoder(f),
+		path: path,
 	}, nil
 }
 
@@ -54,6 +59,7 @@ func OpenWriter(sessionDir string) (*Writer, error) {
 	return &Writer{
 		file: f,
 		enc:  json.NewEncoder(f),
+		path: path,
 	}, nil
 }
 

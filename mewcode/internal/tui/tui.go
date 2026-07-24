@@ -14,6 +14,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/glamour/v2"
 	"mewcode/internal/agent"
+	"mewcode/internal/command"
 	"mewcode/internal/config"
 	"mewcode/internal/conversation"
 	"mewcode/internal/llm"
@@ -86,6 +87,13 @@ type Model struct {
 	pending       *agent.ApprovalRequest // 当前待批准请求
 	approveCursor int                    // 待批准菜单光标位置 (0/1/2)
 
+	// 命令系统
+	cmdRegistry    *command.Registry // 命令注册中心
+	completion     completionMenu    // 斜杠命令补全菜单
+	pendingPrintln []string          // handler 的 Println/Error 缓冲
+	pendingCmd     tea.Cmd           // handler 请求的异步操作
+
+	cwd    string // 当前工作目录
 	width  int
 	height int
 
@@ -134,6 +142,10 @@ func New(providers []config.ProviderConfig, version string, registry *tool.Regis
 	cwd, _ := os.Getwd()
 	sessionsDir := cwd + "/.mewcode/sessions"
 
+	// 构造命令注册中心
+	cmdReg := command.New()
+	command.RegisterBuiltins(cmdReg)
+
 	m := &Model{
 		textarea:        ta,
 		spinner:         sp,
@@ -151,6 +163,8 @@ func New(providers []config.ProviderConfig, version string, registry *tool.Regis
 		instructionText: instructionText,
 		memoryText:      memoryText,
 		sessionsDir:     sessionsDir,
+		cmdRegistry:     cmdReg,
+		cwd:             cwd,
 	}
 
 	if len(providers) == 1 {
@@ -264,6 +278,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case stateApproving:
 			return m.updateApproving(msg)
+		case stateResuming:
+			return m.updateResuming(msg)
 		}
 
 	case agentEvent:
@@ -274,6 +290,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case spinner.TickMsg:
 		return m.handleSpinnerTick(msg)
+
+	case resumeListMsg, resumeDoneMsg:
+		if m.state == stateResuming {
+			return m.updateResuming(msg)
+		}
+		return m, nil
 	}
 
 	var cmd tea.Cmd
@@ -460,24 +482,31 @@ func (m *Model) handleSpinnerTick(msg spinner.TickMsg) (tea.Model, tea.Cmd) {
 
 // handleIdleKey 处理空闲状态的键盘输入
 func (m *Model) handleIdleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	// 先尝试补全菜单键位拦截
+	if cmd, consumed := m.handleCompletionKey(msg); consumed {
+		return m, cmd
+	}
+
 	switch msg.Code {
 	case tea.KeyEnter:
 		if msg.Mod&tea.ModAlt != 0 {
 			var cmd tea.Cmd
 			m.textarea, cmd = m.textarea.Update(msg)
+			m.syncCompletionFromInput()
 			return m, cmd
 		}
 
 		text := strings.TrimSpace(m.textarea.Value())
 		m.textarea.Reset()
+		m.completion.Hide()
 
 		if text == "" {
 			return m, nil
 		}
 
 		// 命令分发：以 / 开头走命令路径
-		if handler, ok := dispatchCommand(text); ok {
-			return m, handler(context.Background(), m)
+		if cmd, handled := m.dispatchSlash(text); handled {
+			return m, cmd
 		}
 
 		return m.submitMessage(text)
@@ -485,6 +514,7 @@ func (m *Model) handleIdleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 	var cmd tea.Cmd
 	m.textarea, cmd = m.textarea.Update(msg)
+	m.syncCompletionFromInput()
 	return m, cmd
 }
 

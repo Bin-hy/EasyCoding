@@ -52,6 +52,20 @@ func (r *SessionRuntime) IncTurn() int {
 	return r.TurnCount
 }
 
+// ResetForNewSession 清空所有 compact 子状态、锚点和轮次计数，替换 Session 引用。
+// ContextWindow 保留不变。
+func (r *SessionRuntime) ResetForNewSession(sesCtx *compact.SessionContext) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.Replacement = nil
+	r.Recovery = nil
+	r.AutoTracking = nil
+	r.Session = sesCtx
+	r.UsageAnchor = 0
+	r.AnchorMsgLen = 0
+	r.TurnCount = 0
+}
+
 // Option 函数式选项，用于 New 的可选参数注入。
 type Option func(*Agent)
 

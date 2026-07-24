@@ -50,6 +50,6 @@ func RenderBanner(version, cwd string) string {
   MewCode v%s
   工作目录: %s
 
-  就绪 — 开始对话吧！
+  就绪 — 输入 /help 查看可用命令
 `, LogoBanner, version, cwd)
 }

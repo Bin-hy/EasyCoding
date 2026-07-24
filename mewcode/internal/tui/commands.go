@@ -6,85 +6,234 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"mewcode/internal/agent"
+	"mewcode/internal/command"
+	"mewcode/internal/compact"
+	"mewcode/internal/conversation"
 	"mewcode/internal/llm"
 	"mewcode/internal/permission"
-	"mewcode/internal/prompt"
+	"mewcode/internal/session"
 )
 
-// commandHandler 命令处理器签名。
-type commandHandler func(ctx context.Context, model *Model) tea.Cmd
+// ============================================================================
+// UI 接口实现 — *Model 实现 command.UI
+// ============================================================================
 
-// builtinCommands 注册表：/exit /plan /do /compact /resume。
-var builtinCommands = map[string]commandHandler{
-	"/exit":    handleExit,
-	"/plan":    handlePlan,
-	"/do":      handleDo,
-	"/compact": handleCompact,
-	"/resume":  handleResume,
+// 只读查询方法
+
+func (m *Model) Mode() permission.Mode { return m.mode }
+func (m *Model) UsageIn() int64        { return m.usageIn }
+func (m *Model) UsageOut() int64       { return m.usageOut }
+func (m *Model) Idle() bool            { return m.state == stateIdle }
+
+func (m *Model) ModelName() string {
+	if m.provider != nil {
+		return m.provider.Model()
+	}
+	return ""
 }
 
-// dispatchCommand 检查输入是否以 / 开头，命中则返回对应处理器。
-// 不以 / 开头返回 nil, false。
-func dispatchCommand(input string) (commandHandler, bool) {
-	if len(input) == 0 || input[0] != '/' {
+func (m *Model) Cwd() string {
+	if m.cwd != "" {
+		return m.cwd
+	}
+	return "."
+}
+
+func (m *Model) ToolCount() int {
+	return m.registry.Count()
+}
+
+func (m *Model) MemoryFiles() []string {
+	if m.memMgr == nil {
+		return nil
+	}
+	project, user := m.memMgr.ListFiles()
+	var all []string
+	all = append(all, project...)
+	all = append(all, user...)
+	return all
+}
+
+func (m *Model) SessionPath() string {
+	if m.writer != nil {
+		return m.writer.Path()
+	}
+	return ""
+}
+
+func (m *Model) SessionID() string {
+	if m.runtime != nil && m.runtime.Session != nil {
+		return m.runtime.Session.SessionID
+	}
+	return ""
+}
+
+// 写入方法
+
+func (m *Model) Println(msg string) {
+	m.pendingPrintln = append(m.pendingPrintln, msg)
+}
+
+func (m *Model) Error(msg string) {
+	m.pendingPrintln = append(m.pendingPrintln, "ERROR\x00"+msg)
+}
+
+func (m *Model) SetMode(mode permission.Mode) {
+	m.mode = mode
+}
+
+func (m *Model) Quit() {
+	if m.cancel != nil {
+		m.cancel()
+	}
+	m.pendingCmd = tea.Quit
+}
+
+func (m *Model) ForceCompact() {
+	if m.ag == nil {
+		m.Error("压缩失败：Agent 未初始化")
+		return
+	}
+	var defs []llm.ToolDefinition
+	if m.mode == permission.ModePlan {
+		defs = m.registry.ReadOnlyDefinitions()
+	} else {
+		defs = m.registry.Definitions()
+	}
+	before, after, err := m.ag.RunForceCompact(context.Background(), m.conv, defs)
+	if err != nil {
+		m.Error(fmt.Sprintf("压缩失败：%v", err))
+	} else {
+		m.Println(fmt.Sprintf("已压缩，token 从 %d 降至 %d", before, after))
+	}
+}
+
+func (m *Model) OpenResumeMenu() {
+	m.state = stateResuming
+	m.textarea.Reset()
+	m.pendingCmd = m.beginResume()
+}
+
+func (m *Model) ClearAndNewSession() {
+	// a. 关闭旧 writer
+	if m.writer != nil {
+		_ = m.writer.Close()
+	}
+
+	// b. 创建新 SessionContext
+	newSesCtx, err := compact.NewSessionContext(m.cwd)
+	if err != nil {
+		m.Error(fmt.Sprintf("创建新会话失败: %v", err))
+		return
+	}
+
+	// c. 创建新 writer
+	newWriter, err := session.NewWriter(newSesCtx.SessionDir)
+	if err != nil {
+		m.Error(fmt.Sprintf("创建会话文件失败: %v", err))
+		return
+	}
+	m.writer = newWriter
+
+	// d. 重建 conversation
+	m.bindConversation(newWriter)
+
+	// e. 重置 runtime
+	if m.runtime != nil {
+		m.runtime.ResetForNewSession(newSesCtx)
+	}
+
+	// f. 归零计数
+	m.iter = 0
+	m.usageIn = 0
+	m.usageOut = 0
+}
+
+func (m *Model) InjectAndSend(label, preset string) {
+	m.conv.AddUser(preset)
+	m.pendingCmd = tea.Batch(
+		tea.Println(renderUserBlock(label)),
+		m.startStreaming(),
+	)
+}
+
+// bindConversation 构造带 callback 的 Conversation。
+// New() 和 ClearAndNewSession 共用此方法。
+func (m *Model) bindConversation(writer *session.Writer) {
+	modelName := ""
+	if m.provider != nil {
+		modelName = m.provider.Model()
+	}
+	onAppend := writer.OnAppend(modelName)
+	onReplace := writer.OnReplace()
+	m.conv = conversation.NewFromMessages(nil, onAppend, onReplace)
+}
+
+// ============================================================================
+// 命令分发
+// ============================================================================
+
+// dispatchSlash 解析并分发斜杠命令。
+// 返回 (tea.Cmd, true) 表示已处理为命令，(nil, false) 表示非命令，需送给 LLM。
+func (m *Model) dispatchSlash(text string) (tea.Cmd, bool) {
+	name, isSlash := command.Parse(text)
+	if !isSlash {
 		return nil, false
 	}
-	if handler, ok := builtinCommands[input]; ok {
-		return handler, true
+
+	// 清空上一轮的 pending 缓冲
+	m.pendingPrintln = nil
+	m.pendingCmd = nil
+
+	cmd, ok := m.cmdRegistry.Lookup(name)
+	if !ok {
+		// 未命中：输出引导提示
+		if name == "" {
+			m.Println("未知命令。输入 /help 查看可用命令")
+		} else {
+			m.Println(fmt.Sprintf("未知命令: /%s。输入 /help 查看可用命令", name))
+		}
+		return m.flushPending(), true
 	}
-	return handleUnknown, true
+
+	// Idle 守护：KindUI / KindPrompt 在非 idle 状态拒绝
+	if (cmd.Kind == command.KindUI || cmd.Kind == command.KindPrompt) && !m.Idle() {
+		m.Error("请等待当前任务完成")
+		return m.flushPending(), true
+	}
+
+	// 执行 handler
+	if err := cmd.Handler(context.Background(), m); err != nil {
+		m.Error(err.Error())
+	}
+
+	return m.flushPending(), true
 }
 
-func handleExit(ctx context.Context, model *Model) tea.Cmd {
-	if model.cancel != nil {
-		model.cancel()
+// flushPending 将 pendingPrintln 和 pendingCmd 合并为一个 tea.Cmd。
+func (m *Model) flushPending() tea.Cmd {
+	var cmds []tea.Cmd
+
+	// 渲染 pendingPrintln
+	for _, msg := range m.pendingPrintln {
+		if len(msg) >= 6 && msg[:6] == "ERROR\x00" {
+			cmds = append(cmds, tea.Println(renderErrorBlock(msg[6:])))
+		} else {
+			cmds = append(cmds, tea.Println(renderNoticeBlock(msg)))
+		}
 	}
-	return tea.Quit
-}
+	m.pendingPrintln = nil
 
-func handlePlan(ctx context.Context, model *Model) tea.Cmd {
-	model.mode = permission.ModePlan
-	return tea.Println(renderNoticeBlock("已进入计划模式（只读工具，产出计划后请用 /do 执行）"))
-}
-
-func handleDo(ctx context.Context, model *Model) tea.Cmd {
-	model.mode = permission.ModeDefault
-	model.conv.AddUser(prompt.ExecuteDirective)
-	return model.startStreaming()
-}
-
-func handleCompact(ctx context.Context, model *Model) tea.Cmd {
-	if model.ag == nil {
-		return tea.Println(renderNoticeBlock("压缩失败：Agent 未初始化"))
-	}
-	// 按当前 mode 取工具集
-	var defs []llm.ToolDefinition
-	if model.mode == permission.ModePlan {
-		defs = model.registry.ReadOnlyDefinitions()
-	} else {
-		defs = model.registry.Definitions()
+	// 追加 pendingCmd
+	if m.pendingCmd != nil {
+		cmds = append(cmds, m.pendingCmd)
+		m.pendingCmd = nil
 	}
 
-	before, after, err := model.ag.RunForceCompact(ctx, model.conv, defs)
-	if err != nil {
-		return tea.Println(renderNoticeBlock(fmt.Sprintf("压缩失败：%v", err)))
+	if len(cmds) == 0 {
+		return nil
 	}
-	return tea.Println(renderNoticeBlock(fmt.Sprintf("已压缩，token 从 %d 降至 %d", before, after)))
-}
-
-// handleResume 进入会话恢复列表。仅在 idle 状态下可用。
-func handleResume(ctx context.Context, model *Model) tea.Cmd {
-	if model.state != stateIdle {
-		return tea.Println(renderNoticeBlock("请等待当前任务完成后再恢复会话"))
-	}
-	if model.ag != nil && model.ag.IsRunning() {
-		return tea.Println(renderNoticeBlock("请等待当前任务完成后再恢复会话"))
-	}
-	return model.beginResume()
-}
-
-func handleUnknown(ctx context.Context, model *Model) tea.Cmd {
-	return tea.Println(renderNoticeBlock("未知命令，可用命令: /exit /plan /do /compact /resume"))
+	return tea.Batch(cmds...)
 }
 
 // formatCompactNotice 将 CompactEvent 格式化为 TUI 展示文案。

@@ -6,8 +6,8 @@ import (
 	"os"
 	"time"
 
-	tea "charm.land/bubbletea/v2"
 	"charm.land/bubbles/v2/list"
+	tea "charm.land/bubbletea/v2"
 
 	"mewcode/internal/compact"
 	"mewcode/internal/conversation"
@@ -70,14 +70,6 @@ func (m *Model) doResumeSession(info session.SessionInfo) tea.Cmd {
 			msgs = append(msgs, llm.Message{Role: llm.RoleUser, Content: reminder})
 		}
 
-		// 构造 Conversation（带回调，恢复后的消息追加到原 JSONL）
-		modelName := ""
-		if m.provider != nil {
-			modelName = m.provider.Model()
-		}
-		onAppend := m.writer.OnAppend(modelName)
-		newConv := conversation.NewFromMessages(msgs, onAppend, m.writer.OnReplace())
-
 		// 重建 SessionContext
 		root, _ := os.Getwd()
 		newCtx, err := compact.OpenSessionContext(root, info.ID)
@@ -85,11 +77,19 @@ func (m *Model) doResumeSession(info session.SessionInfo) tea.Cmd {
 			return resumeDoneMsg{err: fmt.Errorf("打开会话目录失败: %w", err)}
 		}
 
-		// 重新打开 Writer（追加模式）
+		// 重新打开 Writer（追加模式）——必须在构造 Conversation 之前，
+		// 确保 onAppend/onReplace 绑定到恢复后的 JSONL 而非当前会话的 writer。
 		newWriter, err := session.OpenWriter(info.Dir)
 		if err != nil {
 			return resumeDoneMsg{err: fmt.Errorf("打开 JSONL 失败: %w", err)}
 		}
+
+		// 构造 Conversation（带回调，后续消息追加到恢复后的 JSONL）
+		modelName := ""
+		if m.provider != nil {
+			modelName = m.provider.Model()
+		}
+		newConv := conversation.NewFromMessages(msgs, newWriter.OnAppend(modelName), newWriter.OnReplace())
 
 		return resumeDoneMsg{
 			conv:       newConv,
@@ -143,15 +143,23 @@ func (m *Model) updateResuming(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.conv = msg.conv
 		m.writer = msg.writer
 		m.runtime.Session = msg.sessionCtx
+
+		// 在 scrollback 中渲染历史消息
+		historyCmds := renderHistoryMessages(m, msg.conv.Messages())
+
 		m.state = stateIdle
 		notice := fmt.Sprintf("已恢复会话 %s，共 %d 条消息", msg.sessionID, msg.msgCount)
-		return m, tea.Println(renderNoticeBlock(notice))
+		cmds := append(historyCmds, tea.Println(renderNoticeBlock(notice)))
+
+		// 清空残留输入防止误触发"未知命令"
+		m.textarea.Reset()
+		return m, tea.Batch(cmds...)
 
 	case tea.KeyPressMsg:
 		switch msg.Code {
 		case tea.KeyEnter:
 			if item, ok := m.resumeList.SelectedItem().(sessionItem); ok {
-				m.state = stateIdle // 先退出列表态
+				// 不提前切 idle——等 resumeDoneMsg 回来再切
 				return m, m.doResumeSession(item.info)
 			}
 		case tea.KeyEsc:
@@ -160,6 +168,10 @@ func (m *Model) updateResuming(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// 列表未初始化前（beginResume 仍在异步加载）跳过 Update 防 panic
+	if m.resumeList.Items() == nil {
+		return m, nil
+	}
 	var cmd tea.Cmd
 	m.resumeList, cmd = m.resumeList.Update(msg)
 	return m, cmd
@@ -167,6 +179,9 @@ func (m *Model) updateResuming(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // viewResuming 渲染 stateResuming 下的视图。
 func (m *Model) viewResuming() string {
+	if m.resumeList.Items() == nil {
+		return "正在加载会话列表..."
+	}
 	return m.resumeList.View()
 }
 
@@ -230,4 +245,31 @@ func formatSize(size int64) string {
 		return fmt.Sprintf("%.1fKB", float64(size)/1024)
 	}
 	return fmt.Sprintf("%.1fMB", float64(size)/(1024*1024))
+}
+
+// renderHistoryMessages 将对话历史渲染为 scrollback 输出命令。
+func renderHistoryMessages(m *Model, msgs []llm.Message) []tea.Cmd {
+	var cmds []tea.Cmd
+	for _, msg := range msgs {
+		switch msg.Role {
+		case llm.RoleUser:
+			cmds = append(cmds, tea.Println(renderUserBlock(msg.Content)))
+		case llm.RoleAssistant:
+			rendered := msg.Content
+			if m.renderer != nil {
+				if r, err := m.renderer.Render(msg.Content); err == nil {
+					rendered = r
+				}
+			}
+			cmds = append(cmds, tea.Println(renderAssistantBlock(rendered)))
+		case llm.RoleTool:
+			// 工具结果：简化显示
+			summary := msg.Content
+			if len(summary) > 200 {
+				summary = summary[:200] + "..."
+			}
+			cmds = append(cmds, tea.Println(renderNoticeBlock("  "+summary)))
+		}
+	}
+	return cmds
 }
