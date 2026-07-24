@@ -149,6 +149,15 @@ func (m *Manager) UpdateAsync(ctx context.Context, recentMsgs []llm.Message) {
 	}()
 }
 
+// ListFiles 列出项目层与用户层记忆目录下的 .md 文件名（含 MEMORY.md）。
+// 目录不存在视为空 slice；其他错误 log 后视为空 slice。
+// 返回值已按文件名字典序排序。
+func (m *Manager) ListFiles() (project []string, user []string) {
+	project = m.projectStore.ListFiles()
+	user = m.userStore.ListFiles()
+	return
+}
+
 // extractJSON 从文本中提取 JSON 数组部分。
 func extractJSON(text string) string {
 	// 尝试找到第一个 [ 和最后一个 ]

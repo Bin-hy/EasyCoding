@@ -30,6 +30,11 @@ func (r *Registry) Register(t Tool) {
 	r.tools[name] = t
 }
 
+// Count 返回当前已注册工具数量（O(1)）。
+func (r *Registry) Count() int {
+	return len(r.tools)
+}
+
 // Get 按名查找工具。
 func (r *Registry) Get(name string) (Tool, bool) {
 	t, ok := r.tools[name]

@@ -93,6 +93,8 @@ func (m *Model) View() tea.View {
 	switch m.state {
 	case stateSelecting:
 		return tea.NewView(m.viewSelecting())
+	case stateResuming:
+		return tea.NewView(m.viewResuming())
 	case stateApproving:
 		return tea.NewView(m.viewApproving())
 	default:
@@ -113,6 +115,12 @@ func (m *Model) viewChat() string {
 	inputBox := inputBorderStyle.Render(m.textarea.View())
 	b.WriteString(inputBox)
 	b.WriteString("\n")
+
+	// 补全菜单（紧贴输入框下方）
+	if m.completion.active {
+		b.WriteString(m.completion.Render(m.width))
+		b.WriteString("\n")
+	}
 
 	// 状态栏
 	b.WriteString(m.renderStatusBar())

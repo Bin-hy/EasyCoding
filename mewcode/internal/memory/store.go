@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,35 @@ func NewStore(dir string) *Store {
 // EnsureDir 确保存储目录存在。
 func (s *Store) EnsureDir() error {
 	return os.MkdirAll(s.dir, 0o755)
+}
+
+// ListFiles 列出存储目录下所有 .md 文件名（含 MEMORY.md）。
+// 目录不存在视为空 slice，其他错误 log 后视为空 slice。
+// 返回值已按文件名字典序排序。
+func (s *Store) ListFiles() []string {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			// 非"目录不存在"的错误记录日志
+			fmt.Fprintf(os.Stderr, "[memory] 读取记忆目录失败: %v\n", err)
+		}
+		return nil
+	}
+
+	var files []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasSuffix(name, ".md") {
+			files = append(files, name)
+		}
+	}
+
+	// 已在内存中排序，但为了确定性再做一次
+	sort.Strings(files)
+	return files
 }
 
 // LoadIndex 读取 MEMORY.md 内容。不存在返回空字符串。
