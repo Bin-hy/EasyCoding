@@ -172,6 +172,7 @@ func (s *Store) appendIndex(noteType, title, desc string) error {
 	if err != nil {
 		return err
 	}
+	//nolint:errcheck // 预存 defer close 不检查
 	defer f.Close()
 
 	_, err = f.Write([]byte(line))

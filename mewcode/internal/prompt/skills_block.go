@@ -28,7 +28,7 @@ func RenderSkillsCatalog(items []SkillCatalogItem) string {
 	sb.WriteString("## 可用 Skill（调用 LoadSkill 工具激活）\n\n")
 	sb.WriteString("以下 Skill 可通过 LoadSkill 工具按需激活。激活后 SOP 将钉在环境上下文最显眼位置。\n\n")
 	for _, item := range items {
-		sb.WriteString(fmt.Sprintf("- **/%s**: %s\n", item.Name, item.Description))
+		fmt.Fprintf(&sb, "- **/%s**: %s\n", item.Name, item.Description)
 	}
 	return sb.String()
 }
@@ -44,7 +44,7 @@ func RenderActiveSkillsBlock(entries []ActiveSkillEntry) string {
 	sb.WriteString("## Active Skills\n\n")
 	sb.WriteString("以下 Skill 已激活，其 SOP 指令优先于通用系统指令：\n\n")
 	for _, e := range entries {
-		sb.WriteString(fmt.Sprintf("### Skill: %s\n\n%s\n\n", e.Name, e.Body))
+		fmt.Fprintf(&sb, "### Skill: %s\n\n%s\n\n", e.Name, e.Body)
 	}
 	return strings.TrimRight(sb.String(), "\n")
 }

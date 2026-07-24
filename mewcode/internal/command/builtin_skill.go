@@ -91,7 +91,7 @@ func handleSkillList(ui UI, deps *SkillCommandDeps) error {
 // handleSkillInfo 查看单个 Skill 详细信息。
 func handleSkillInfo(ui UI, deps *SkillCommandDeps, name string) error {
 	if deps == nil || deps.Executor == nil {
-		return fmt.Errorf("Skill 系统未初始化")
+		return fmt.Errorf("skill 系统未初始化")
 	}
 
 	sk, err := deps.Executor.GetSkillDetail(name)
@@ -118,7 +118,7 @@ func handleSkillInfo(ui UI, deps *SkillCommandDeps, name string) error {
 // handleSkillReload 重新扫描 Skill 目录并重建命令。
 func handleSkillReload(ui UI, deps *SkillCommandDeps) error {
 	if deps == nil || deps.Executor == nil || deps.CmdReg == nil {
-		return fmt.Errorf("Skill 系统未完全初始化")
+		return fmt.Errorf("skill 系统未完全初始化")
 	}
 
 	added, removed := deps.Executor.ReloadCatalog(deps.WorkDir)

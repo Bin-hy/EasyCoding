@@ -60,10 +60,7 @@ func handleMemory(ctx context.Context, ui UI) error {
 		return nil
 	}
 
-	var lines []string
-	for _, f := range files {
-		lines = append(lines, f)
-	}
+	lines := append([]string{}, files...)
 	ui.Println(joinLines(lines))
 	return nil
 }

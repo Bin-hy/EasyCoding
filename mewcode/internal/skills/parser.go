@@ -26,13 +26,6 @@ func parseSkillDir(dir string, source SkillSource) (*Skill, error) {
 	}, nil
 }
 
-// parseFrontmatterOnly 仅解析 SKILL.md 的 frontmatter，不读取 body。
-// 用于阶段 1 启动加载——快速的 name + description 索引。
-func parseFrontmatterOnly(mdPath string) (SkillMeta, error) {
-	meta, _, err := parseSkillMD(mdPath)
-	return meta, err
-}
-
 // loadSkillBody 从磁盘强制重读 SKILL.md 的 body。
 // 用于阶段 2（热重载）：每次执行时获取最新 SOP 指令。
 func loadSkillBody(s *Skill) error {
@@ -104,9 +97,7 @@ func splitFrontmatter(content string) (SkillMeta, string, error) {
 	// 查找首行 "---" 之后的内容
 	afterFirst := content[3:]
 	// 跳过紧随的 \n（如果有）
-	if strings.HasPrefix(afterFirst, "\n") {
-		afterFirst = afterFirst[1:]
-	}
+	afterFirst = strings.TrimPrefix(afterFirst, "\n")
 
 	// 查找独占一行的闭合 "---"
 	endIdx := strings.Index(afterFirst, "\n---\n")

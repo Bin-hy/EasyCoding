@@ -1,6 +1,7 @@
 package command
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -94,7 +95,7 @@ func (r *recordingUI) Quit() {
 
 func TestHandleStatus_PrintsAllKeys(t *testing.T) {
 	rec := newRecordingUI()
-	_ = handleStatus(nil, rec)
+	_ = handleStatus(context.TODO(), rec)
 
 	if len(rec.printlnCalls) == 0 {
 		t.Fatal("handleStatus 应调用 Println")
@@ -110,7 +111,7 @@ func TestHandleStatus_PrintsAllKeys(t *testing.T) {
 
 func TestHandleDo_SetsModeAndInjects(t *testing.T) {
 	rec := newRecordingUI()
-	_ = handleDo(nil, rec)
+	_ = handleDo(context.TODO(), rec)
 
 	if len(rec.setModeCalls) != 1 || rec.setModeCalls[0] != permission.ModeDefault {
 		t.Error("handleDo 应调用 SetMode(ModeDefault)")

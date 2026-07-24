@@ -201,6 +201,8 @@ func estimateTokens(msgs []llm.Message) int64 {
 }
 
 // relativeTime 返回友好的相对时间。
+//
+//nolint:unused // 待 future 使用
 func relativeTime(t time.Time) string {
 	elapsed := time.Since(t)
 	switch {
@@ -237,6 +239,8 @@ func formatDuration(d time.Duration) string {
 }
 
 // formatSize 格式化文件大小。
+//
+//nolint:unused // 待 future 使用
 func formatSize(size int64) string {
 	if size < 1024 {
 		return fmt.Sprintf("%dB", size)

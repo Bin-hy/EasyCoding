@@ -89,6 +89,7 @@ func readFirstUser(path string) (title, model string) {
 	if err != nil {
 		return "(无法读取)", ""
 	}
+	//nolint:errcheck // 预存 defer close 不检查
 	defer f.Close()
 
 	dec := json.NewDecoder(f)

@@ -104,6 +104,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "[session] 创建 JSONL Writer 失败: %v\n", err)
 		os.Exit(1)
 	}
+	//nolint:errcheck // 预存 defer close 不检查
 	defer writer.Close()
 
 	// --- ch09: 后台清理过期会话 ---

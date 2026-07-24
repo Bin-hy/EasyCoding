@@ -82,7 +82,7 @@ func Install(name, apiURL, installRoot string) (*InstallReport, error) {
 	if err != nil {
 		return nil, fmt.Errorf("创建临时目录失败: %w", err)
 	}
-	defer os.RemoveAll(staging)
+	defer func() { _ = os.RemoveAll(staging) }()
 
 	// 递归下载
 	client := &http.Client{Timeout: installHTTPTimeout}
@@ -140,7 +140,7 @@ func fetchGitHubDir(client *http.Client, apiURL string, dest string, depth int, 
 	if err != nil {
 		return 0, fmt.Errorf("GitHub API 请求失败: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusForbidden {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
@@ -223,7 +223,7 @@ func downloadFile(client *http.Client, url, dest string) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
@@ -237,7 +237,7 @@ func downloadFile(client *http.Client, url, dest string) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	_, err = io.Copy(f, io.LimitReader(resp.Body, maxInstallFileSize))
 	return err

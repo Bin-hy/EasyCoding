@@ -54,7 +54,7 @@ func (a *ActiveSkills) ToPromptEntries() []ActiveSkillEntry {
 	snapshot := a.Snapshot()
 	result := make([]ActiveSkillEntry, len(snapshot))
 	for i, e := range snapshot {
-		result[i] = ActiveSkillEntry{Name: e.Name, Body: e.Body}
+		result[i] = ActiveSkillEntry(e)
 	}
 	return result
 }

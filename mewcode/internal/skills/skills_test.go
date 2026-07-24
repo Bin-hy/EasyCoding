@@ -111,6 +111,7 @@ description: 没名字
 
 	tmpDir := t.TempDir()
 	mdPath := filepath.Join(tmpDir, "SKILL.md")
+	//nolint:errcheck
 	os.WriteFile(mdPath, []byte(content), 0o644)
 
 	_, _, err := parseSkillMD(mdPath)
@@ -226,12 +227,14 @@ func TestCatalog_LoadFromDir(t *testing.T) {
 
 	// 创建 SKILL.md
 	skillDir := filepath.Join(tmpDir, "test-skill")
+	//nolint:errcheck
 	os.MkdirAll(skillDir, 0o755)
 	content := `---
 name: test-skill
 description: 测试用
 ---
 测试 body`
+	//nolint:errcheck
 	os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(content), 0o644)
 
 	cat := &Catalog{byName: make(map[string]*Skill)}
@@ -255,12 +258,16 @@ func TestCatalog_SkipInvalid(t *testing.T) {
 
 	// 创建无 name 的 SKILL.md
 	badDir := filepath.Join(tmpDir, "bad-skill")
+	//nolint:errcheck
 	os.MkdirAll(badDir, 0o755)
+	//nolint:errcheck
 	os.WriteFile(filepath.Join(badDir, "SKILL.md"), []byte("just body"), 0o644)
 
 	// 创建正常的
 	goodDir := filepath.Join(tmpDir, "good-skill")
+	//nolint:errcheck
 	os.MkdirAll(goodDir, 0o755)
+	//nolint:errcheck
 	os.WriteFile(filepath.Join(goodDir, "SKILL.md"), []byte(`---
 name: good
 description: good skill
