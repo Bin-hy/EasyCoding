@@ -19,6 +19,7 @@ import (
 	"mewcode/internal/memory"
 	"mewcode/internal/permission"
 	"mewcode/internal/prompt"
+	"mewcode/internal/skills"
 	"mewcode/internal/tool"
 )
 
@@ -94,6 +95,7 @@ type Agent struct {
 	eng             *permission.Engine // 权限引擎（前四层判定 + 配置）
 	runtime         *SessionRuntime    // 跨 Run 复用的长生命周期状态
 	memMgr          *memory.Manager    // 可选：记忆更新管理器
+	catalog         *skills.Catalog    // 可选：Skill 目录（用于第一阶段列表与 ClearActiveSkills）
 	instructionText string             // 项目指令文本（注入系统提示）
 	memoryText      string             // 记忆索引文本（注入系统提示）
 	runMu           sync.Mutex         // 保证 Run 与 RunForceCompact 不并发
@@ -115,6 +117,21 @@ func New(p llm.Provider, r *tool.Registry, version string, eng *permission.Engin
 		a.runtime = &SessionRuntime{ContextWindow: 200000}
 	}
 	return a
+}
+
+// ActivateSkill 激活一个 Skill，将 name + body 钉到 env context。
+// 每轮 Agent Loop 重建时注入。同名重复激活会覆盖原位置。
+func (a *Agent) ActivateSkill(name, body string) {
+	if a.runtime != nil && a.runtime.ActiveSkills != nil {
+		a.runtime.ActiveSkills.Activate(name, body)
+	}
+}
+
+// ClearActiveSkills 清空所有已激活 Skill。
+func (a *Agent) ClearActiveSkills() {
+	if a.runtime != nil && a.runtime.ActiveSkills != nil {
+		a.runtime.ActiveSkills.Clear()
+	}
 }
 
 // 迭代与停止常量（内置，不可配）
@@ -151,8 +168,18 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode p
 
 		// 采集环境信息与装配稳定系统提示（Run 起始一次，跨轮复用）
 		env := prompt.GatherEnvironment(a.version, a.provider.Model())
-		sys := prompt.BuildSystemPrompt(a.instructionText, a.memoryText)
-		envText := env.Render()
+
+		// Skill catalog 注入第一阶段 system prompt
+		var skillsCatalogText string
+		if a.catalog != nil {
+			items := a.catalog.ToPromptItems()
+			promptItems := make([]prompt.SkillCatalogItem, len(items))
+			for i, item := range items {
+				promptItems[i] = prompt.SkillCatalogItem{Name: item.Name, Description: item.Description}
+			}
+			skillsCatalogText = prompt.RenderSkillsCatalog(promptItems)
+		}
+		sys := prompt.BuildSystemPrompt(a.instructionText, a.memoryText, skillsCatalogText)
 		unknownRun := 0
 
 		for iter := 1; iter <= maxIterations; iter++ {
@@ -217,6 +244,19 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode p
 			if mode == permission.ModePlan {
 				full := iter == 1 || (iter-1)%planReminderInterval == 0
 				reminder = prompt.PlanReminder(full)
+			}
+
+			// 构建环境文本（每轮重建以反映活跃 Skill 变更）
+			envText := env.Render()
+			if a.runtime != nil && a.runtime.ActiveSkills != nil {
+				entries := a.runtime.ActiveSkills.ToPromptEntries()
+				if len(entries) > 0 {
+					promptEntries := make([]prompt.ActiveSkillEntry, len(entries))
+					for i, e := range entries {
+						promptEntries[i] = prompt.ActiveSkillEntry{Name: e.Name, Body: e.Body}
+					}
+					envText = envText + "\n\n" + prompt.RenderActiveSkillsBlock(promptEntries)
+				}
 			}
 
 			// 流式请求本轮

@@ -5,6 +5,7 @@ import (
 
 	"mewcode/internal/compact"
 	"mewcode/internal/memory"
+	"mewcode/internal/skills"
 )
 
 // SessionRuntime 跨 Run 调用的长生命周期状态容器。
@@ -18,6 +19,7 @@ type SessionRuntime struct {
 	UsageAnchor   int64      // 主对话路径 Stream 真实 usage 之和；摘要请求不更新
 	AnchorMsgLen  int        // anchor 当时 Conversation.Len()
 	TurnCount     int        // 会话轮次计数（用于记忆更新触发）
+	ActiveSkills  *skills.ActiveSkills // 已激活 Skill 列表（跨轮保持）
 	mu            sync.Mutex // 保护 UsageAnchor / AnchorMsgLen / TurnCount 的读写
 }
 
@@ -53,7 +55,7 @@ func (r *SessionRuntime) IncTurn() int {
 }
 
 // ResetForNewSession 清空所有 compact 子状态、锚点和轮次计数，替换 Session 引用。
-// ContextWindow 保留不变。
+// ContextWindow 保留不变。同时清空 ActiveSkills。
 func (r *SessionRuntime) ResetForNewSession(sesCtx *compact.SessionContext) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -64,6 +66,9 @@ func (r *SessionRuntime) ResetForNewSession(sesCtx *compact.SessionContext) {
 	r.UsageAnchor = 0
 	r.AnchorMsgLen = 0
 	r.TurnCount = 0
+	if r.ActiveSkills != nil {
+		r.ActiveSkills.Clear()
+	}
 }
 
 // Option 函数式选项，用于 New 的可选参数注入。
@@ -94,5 +99,12 @@ func WithInstructionText(text string) Option {
 func WithMemoryText(text string) Option {
 	return func(a *Agent) {
 		a.memoryText = text
+	}
+}
+
+// WithCatalog 注入 Skill 目录引用。
+func WithCatalog(c *skills.Catalog) Option {
+	return func(a *Agent) {
+		a.catalog = c
 	}
 }

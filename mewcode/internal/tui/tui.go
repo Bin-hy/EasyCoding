@@ -22,6 +22,7 @@ import (
 	"mewcode/internal/permission"
 	"mewcode/internal/prompt"
 	"mewcode/internal/session"
+	"mewcode/internal/skills"
 	"mewcode/internal/tool"
 )
 
@@ -93,6 +94,11 @@ type Model struct {
 	pendingPrintln []string          // handler 的 Println/Error 缓冲
 	pendingCmd     tea.Cmd           // handler 请求的异步操作
 
+	// Skill 系统
+	skillCatalog  *skills.Catalog            // Skill 目录
+	skillExecutor *skills.Executor           // Skill 执行器
+	skillDeps     *command.SkillCommandDeps  // /skill 命令依赖
+
 	cwd    string // 当前工作目录
 	width  int
 	height int
@@ -146,6 +152,11 @@ func New(providers []config.ProviderConfig, version string, registry *tool.Regis
 	cmdReg := command.New()
 	command.RegisterBuiltins(cmdReg)
 
+	// 初始化 Skill 系统
+	cat := skills.LoadCatalog(cwd)
+	activeSkills := skills.NewActiveSkills()
+	runtime.ActiveSkills = activeSkills
+
 	m := &Model{
 		textarea:        ta,
 		spinner:         sp,
@@ -164,6 +175,7 @@ func New(providers []config.ProviderConfig, version string, registry *tool.Regis
 		memoryText:      memoryText,
 		sessionsDir:     sessionsDir,
 		cmdRegistry:     cmdReg,
+		skillCatalog:    cat,
 		cwd:             cwd,
 	}
 
@@ -175,8 +187,8 @@ func New(providers []config.ProviderConfig, version string, registry *tool.Regis
 			m.provider = p
 		}
 		m.state = stateIdle
-		// 构造常驻 Agent（含记忆管理器）
-		opts := []agent.Option{agent.WithRuntime(runtime)}
+		// 构造常驻 Agent（含记忆管理器、Skill Catalog）
+		opts := []agent.Option{agent.WithRuntime(runtime), agent.WithCatalog(cat)}
 		if memMgr != nil {
 			opts = append(opts, agent.WithMemoryManager(memMgr))
 		}
@@ -187,6 +199,41 @@ func New(providers []config.ProviderConfig, version string, registry *tool.Regis
 			opts = append(opts, agent.WithMemoryText(memoryText))
 		}
 		m.ag = agent.New(m.provider, m.registry, m.version, m.engine, opts...)
+
+		// 构造 Skill 执行器（Agent 实现 SkillHost）
+		m.skillExecutor = skills.NewExecutor(cat, m.ag)
+
+		// 注册 Skill 命令（返回已注册名称列表）
+		command.RegisterSkillsAsCommands(cmdReg, cat, m.skillExecutor)
+
+		// 注册 LoadSkillTool（系统工具，始终可见）
+		loadTool := tool.NewLoadSkillTool(m.skillExecutor)
+		registry.Register(loadTool)
+
+		// 注册 InstallSkillTool（普通工具，受权限约束）
+		installTool := tool.NewInstallSkillTool(cwd, cat, func(name string) {
+			// OnInstalled 回调：安装后重新注册所有 Skill 命令
+			command.RegisterSkillsAsCommands(cmdReg, cat, m.skillExecutor)
+		})
+		registry.Register(installTool)
+
+		// 校验工具白名单
+		issues := cat.ValidateTools(func(name string) bool {
+			_, ok := registry.Get(name)
+			return ok
+		})
+		for _, issue := range issues {
+			fmt.Fprintf(os.Stderr, "[skills] warn: Skill %q 引用了不存在的工具 %q\n", issue.Skill, issue.Tool)
+		}
+
+		// 注册 /skill 命令
+		m.skillDeps = &command.SkillCommandDeps{
+			Catalog:  cat,
+			Executor: m.skillExecutor,
+			WorkDir:  cwd,
+			CmdReg:   cmdReg,
+		}
+		command.RegisterSkillCmd(cmdReg, m.skillDeps)
 	} else {
 		m.state = stateSelecting
 		m.initList()

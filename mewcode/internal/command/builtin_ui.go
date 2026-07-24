@@ -31,9 +31,10 @@ func handleResume(ctx context.Context, ui UI) error {
 	return nil
 }
 
-// handleClear 清空当前会话并开启新会话。
+// handleClear 清空当前会话并开启新会话，同时清除已激活 Skill。
 func handleClear(ctx context.Context, ui UI) error {
 	ui.ClearAndNewSession()
+	ui.ClearActiveSkills()
 	ui.Println("已清空当前会话，开启新 session")
 	return nil
 }

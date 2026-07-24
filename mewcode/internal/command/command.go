@@ -10,9 +10,10 @@ import (
 type Kind int
 
 const (
-	KindLocal  Kind = iota // 纯本地：只打印信息，不改 Model，不进对话历史
-	KindUI                 // 影响界面：可改 Model 状态，不进对话历史
-	KindPrompt             // 提示词：向对话注入 user 消息 + 触发 LLM 回合
+	KindLocal     Kind = iota // 纯本地：只打印信息，不改 Model，不进对话历史
+	KindUI                    // 影响界面：可改 Model 状态，不进对话历史
+	KindPrompt               // 提示词：向对话注入 user 消息 + 触发 LLM 回合
+	KindSkillFork            // Skill fork：异步执行后以 assistant 消息写入对话
 )
 
 // Handler 命令处理函数签名。
