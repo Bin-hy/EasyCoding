@@ -102,6 +102,15 @@ type Agent struct {
 	hookEngine      *hook.Engine       // Hook 事件分派引擎
 	runMu           sync.Mutex         // 保证 Run 与 RunForceCompact 不并发
 	running         int32              // 原子标记：是否正在执行 Run
+
+	// 子 Agent 专用字段（spec F10）
+	systemPrompt     string             // 子 Agent 角色系统提示（非空时覆盖默认）
+	maxTurns         int                // 最大迭代轮数（0=用全局 maxIterations）
+	permissionMode   permission.Mode    // 子 Agent 权限模式
+	permissionModeSet bool              // 区分零值与未设置
+	dontAsk          bool               // 子 Agent dontAsk 模式：自动批准所有规则未命中的工具
+	approvalUpgrader ApprovalUpgrader   // 子 Agent 审批升级到父 TUI 的回调
+	allowedTools     []string           // 工具白名单（子 Agent 专用；空=不限制）
 }
 
 // IsRunning 返回 Agent 当前是否正在执行 Run。
@@ -749,6 +758,78 @@ func (a *Agent) executeBatched(ctx context.Context, calls []llm.ToolCall, mode p
 				i++
 
 			case permission.Ask:
+				// 子 Agent dontAsk 模式：直接 Allow（spec F12.2）
+				if a.dontAsk {
+					results[i] = a.runTool(ctx, call)
+					if !emit(ctx, ch, Event{Tool: &ToolEvent{
+						Name:    call.Name,
+						Args:    argsPreview,
+						Phase:   PhaseEnd,
+						Result:  argPreview(json.RawMessage(results[i].Content)),
+						IsError: results[i].IsError,
+					}}) {
+						for m := i + 1; m < len(calls); m++ {
+							if results[m].ToolCallID == "" {
+								results[m] = llm.ToolResult{
+									ToolCallID: calls[m].ID,
+									Content:    noticeCancelled,
+									IsError:    true,
+								}
+							}
+						}
+						return results, false
+					}
+					i++
+					continue
+				}
+
+				// 子 Agent 升级到父 TUI 审批（spec F12.3）
+				if a.approvalUpgrader != nil {
+					req := &ApprovalRequest{
+						Name:    call.Name,
+						Args:    argsPreview,
+						Reason:  reason,
+						Respond: make(chan permission.Outcome, 1),
+					}
+					outcome, okUp := a.approvalUpgrader(ctx, req)
+					if okUp {
+						switch outcome {
+						case permission.OutcomeDenyOnce:
+							results[i] = llm.ToolResult{
+								ToolCallID: call.ID,
+								Content:    "用户拒绝执行：" + reason,
+								IsError:    true,
+							}
+						case permission.OutcomeAllowOnce:
+							results[i] = a.runTool(ctx, call)
+						case permission.OutcomeAllowForever:
+							_ = a.eng.PersistLocalAllow(call)
+							results[i] = a.runTool(ctx, call)
+						}
+						if !emit(ctx, ch, Event{Tool: &ToolEvent{
+							Name:    call.Name,
+							Args:    argsPreview,
+							Phase:   PhaseEnd,
+							Result:  argPreview(json.RawMessage(results[i].Content)),
+							IsError: results[i].IsError,
+						}}) {
+							for m := i + 1; m < len(calls); m++ {
+								if results[m].ToolCallID == "" {
+									results[m] = llm.ToolResult{
+										ToolCallID: calls[m].ID,
+										Content:    noticeCancelled,
+										IsError:    true,
+									}
+								}
+							}
+							return results, false
+						}
+						i++
+						continue
+					}
+					// okUp=false: 降级走默认 Approval 路径
+				}
+
 				outcome, ok2 := a.requestApproval(ctx, call, reason, ch)
 				if !ok2 {
 					for m := i; m < len(calls); m++ {
@@ -915,6 +996,18 @@ func (a *Agent) requestApproval(ctx context.Context, call llm.ToolCall, reason s
 		return o, true
 	case <-ctx.Done():
 		return 0, false
+	}
+}
+
+// runTool 执行单个工具调用并返回结果（spec F12 dontAsk 与 approvalUpgrader 路径复用）。
+func (a *Agent) runTool(ctx context.Context, call llm.ToolCall) llm.ToolResult {
+	tctx, cancel := context.WithTimeout(ctx, tool.DefaultTimeout)
+	defer cancel()
+	r := a.registry.Execute(tctx, call.Name, call.Input)
+	return llm.ToolResult{
+		ToolCallID: call.ID,
+		Content:    r.Content,
+		IsError:    r.IsError,
 	}
 }
 
