@@ -38,6 +38,18 @@ func truncate(s string, maxLines, maxChars int) string {
 	return s
 }
 
+// SystemTool 可选接口：实现此接口的工具标记为系统工具。
+// 系统工具在工具过滤时总是可见，不受白名单约束。
+type SystemTool interface {
+	IsSystem() bool
+}
+
+// IsSystemTool 检测一个工具是否为系统工具。
+func IsSystemTool(t Tool) bool {
+	st, ok := t.(SystemTool)
+	return ok && st.IsSystem()
+}
+
 // errorResult 生成一个 IsError 的结构化错误结果。
 func errorResult(format string, args ...interface{}) Result {
 	return Result{

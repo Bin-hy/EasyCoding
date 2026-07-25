@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	tea "charm.land/bubbletea/v2"
 	"mewcode/internal/agent"
@@ -115,6 +116,9 @@ func (m *Model) OpenResumeMenu() {
 }
 
 func (m *Model) ClearAndNewSession() {
+	// Hook: SessionEnd（旧会话）
+	m.dispatchSessionEnd()
+
 	// a. 关闭旧 writer
 	if m.writer != nil {
 		_ = m.writer.Close()
@@ -147,6 +151,9 @@ func (m *Model) ClearAndNewSession() {
 	m.iter = 0
 	m.usageIn = 0
 	m.usageOut = 0
+
+	// Hook: SessionStart（新会话）
+	m.dispatchSessionStart()
 }
 
 func (m *Model) InjectAndSend(label, preset string) {
@@ -155,6 +162,19 @@ func (m *Model) InjectAndSend(label, preset string) {
 		tea.Println(renderUserBlock(label)),
 		m.startStreaming(),
 	)
+}
+
+// AppendAssistantMessage fork 模式：将子 Agent 结果写入主对话历史。
+func (m *Model) AppendAssistantMessage(text string) {
+	m.conv.AddAssistant(text)
+	m.pendingPrintln = append(m.pendingPrintln, renderAssistantBlock(text))
+}
+
+// ClearActiveSkills /clear 时清空已激活 Skill。
+func (m *Model) ClearActiveSkills() {
+	if m.ag != nil {
+		m.ag.ClearActiveSkills()
+	}
 }
 
 // bindConversation 构造带 callback 的 Conversation。
@@ -185,6 +205,22 @@ func (m *Model) dispatchSlash(text string) (tea.Cmd, bool) {
 	m.pendingPrintln = nil
 	m.pendingCmd = nil
 
+	// command.Parse 对带参数的命令返回 ("", true)，需要手动提取命令名
+	if name == "" {
+		raw := strings.TrimPrefix(strings.TrimSpace(text), "/")
+		if idx := strings.IndexByte(raw, ' '); idx > 0 {
+			name = strings.ToLower(raw[:idx])
+		} else if raw != "" {
+			name = strings.ToLower(raw)
+		}
+	}
+
+	// /skill 子命令：特殊处理（解析 args）
+	if name == "skill" {
+		m.handleSkillCmd(text)
+		return m.flushPending(), true
+	}
+
 	cmd, ok := m.cmdRegistry.Lookup(name)
 	if !ok {
 		// 未命中：输出引导提示
@@ -196,8 +232,8 @@ func (m *Model) dispatchSlash(text string) (tea.Cmd, bool) {
 		return m.flushPending(), true
 	}
 
-	// Idle 守护：KindUI / KindPrompt 在非 idle 状态拒绝
-	if (cmd.Kind == command.KindUI || cmd.Kind == command.KindPrompt) && !m.Idle() {
+	// Idle 守护：KindUI / KindPrompt / KindSkillFork 在非 idle 状态拒绝
+	if (cmd.Kind == command.KindUI || cmd.Kind == command.KindPrompt || cmd.Kind == command.KindSkillFork) && !m.Idle() {
 		m.Error("请等待当前任务完成")
 		return m.flushPending(), true
 	}
@@ -208,6 +244,26 @@ func (m *Model) dispatchSlash(text string) (tea.Cmd, bool) {
 	}
 
 	return m.flushPending(), true
+}
+
+// handleSkillCmd 处理 /skill 子命令。
+func (m *Model) handleSkillCmd(text string) {
+	// 提取子命令和参数: /skill list | /skill info <name> | /skill reload
+	trimmed := strings.TrimPrefix(strings.TrimSpace(text), "/")
+	parts := strings.Fields(trimmed)
+	args := ""
+	if len(parts) > 1 {
+		args = strings.Join(parts[1:], " ")
+	}
+
+	if m.skillDeps == nil {
+		m.Println("Skill 系统未初始化")
+		return
+	}
+
+	if err := command.HandleSkillSub(m, args, m.skillDeps); err != nil {
+		m.Error(err.Error())
+	}
 }
 
 // flushPending 将 pendingPrintln 和 pendingCmd 合并为一个 tea.Cmd。

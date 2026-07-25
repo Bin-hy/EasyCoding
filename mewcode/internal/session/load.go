@@ -15,28 +15,21 @@ func LoadSession(sessionDir string) ([]llm.Message, error) {
 	if err != nil {
 		return nil, err
 	}
+	//nolint:errcheck
 	defer f.Close()
 
-	// 第一遍扫描：找到最后一个 compact 标记的行号
-	var compactLine int = -1
+	// 第一遍扫描：compact 标记重置 entries，之后收集的消息即为最终历史
 	var entries []Entry
 	dec := json.NewDecoder(f)
-	lineNo := 0
 	for dec.More() {
 		var entry Entry
 		if err := dec.Decode(&entry); err != nil {
 			// 跳过坏行，继续
-			lineNo++
 			continue
 		}
-		lineNo++
 		if entry.Type == "compact" {
-			compactLine = lineNo - 1 // 记录 compact 标记之前的索引
-			entries = nil            // 清空，从 compact 之后重新开始
+			entries = nil // 清空，从 compact 之后重新开始
 			continue
-		}
-		if compactLine >= 0 {
-			// compact 之后才收集
 		}
 		entries = append(entries, entry)
 	}
@@ -89,6 +82,7 @@ func LoadSessionRaw(sessionDir string) ([]Entry, error) {
 	if err != nil {
 		return nil, err
 	}
+	//nolint:errcheck
 	defer f.Close()
 
 	var entries []Entry

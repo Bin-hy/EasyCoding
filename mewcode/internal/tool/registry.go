@@ -89,6 +89,48 @@ func (r *Registry) Execute(ctx context.Context, name string, args json.RawMessag
 	return t.Execute(ctx, args)
 }
 
+// DefinitionsFiltered 按白名单 + 系统工具豁免过滤导出工具定义。
+// allowed 为空时不限制；allowed 非空时只返回白名单中的工具 + 所有系统工具。
+func (r *Registry) DefinitionsFiltered(allowed []string) []llm.ToolDefinition {
+	if len(allowed) == 0 {
+		return r.Definitions()
+	}
+
+	allowedSet := make(map[string]bool, len(allowed))
+	for _, name := range allowed {
+		allowedSet[name] = true
+	}
+
+	defs := make([]llm.ToolDefinition, 0, len(r.order))
+	for _, name := range r.order {
+		t := r.tools[name]
+		// 系统工具豁免
+		if IsSystemTool(t) {
+			defs = append(defs, llm.ToolDefinition{
+				Name:        t.Name(),
+				Description: t.Description(),
+				InputSchema: t.Parameters(),
+			})
+			continue
+		}
+		if allowedSet[t.Name()] {
+			defs = append(defs, llm.ToolDefinition{
+				Name:        t.Name(),
+				Description: t.Description(),
+				InputSchema: t.Parameters(),
+			})
+		}
+	}
+	return defs
+}
+
+// Names 返回所有已注册工具的 name 列表。
+func (r *Registry) Names() []string {
+	names := make([]string, len(r.order))
+	copy(names, r.order)
+	return names
+}
+
 // NewDefaultRegistry 构造并注册 6 个核心工具。
 func NewDefaultRegistry() *Registry {
 	r := &Registry{}

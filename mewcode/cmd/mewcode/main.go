@@ -11,6 +11,7 @@ import (
 	"mewcode/internal/compact"
 	"mewcode/internal/config"
 	"mewcode/internal/conversation"
+	"mewcode/internal/hook"
 	"mewcode/internal/instructions"
 	"mewcode/internal/mcp"
 	"mewcode/internal/memory"
@@ -84,6 +85,9 @@ func main() {
 		// eng 必非 nil，继续运行
 	}
 
+	// --- ch12: 加载 Hook 引擎 ---
+	hookEngine, _ := hook.Load(root)
+
 	// --- ch09: 构造会话级运行时状态（含 SessionDir）---
 	sessionCtx, err := compact.NewSessionContext(root)
 	if err != nil {
@@ -104,6 +108,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "[session] 创建 JSONL Writer 失败: %v\n", err)
 		os.Exit(1)
 	}
+	//nolint:errcheck // 预存 defer close 不检查
 	defer writer.Close()
 
 	// --- ch09: 后台清理过期会话 ---
@@ -122,13 +127,20 @@ func main() {
 	conv := conversation.NewWithHooks(writer.OnAppend(modelName), writer.OnReplace())
 
 	// 启动 TUI
-	m := tui.New(cfg.Providers, version, reg, eng, runtime, writer, memMgr, instructionText, memoryText)
+	m := tui.New(cfg.Providers, version, reg, eng, runtime, writer, memMgr, instructionText, memoryText, hookEngine)
 	// 注入带回调的 Conversation（覆盖 TUI 内部创建的空 Conversation）
 	m.SetConversation(conv)
 
 	if err := m.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "运行错误: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Hook: SessionEnd 兜底（进程退出前）
+	if hookEngine != nil {
+		hookEngine.Dispatch(context.Background(), hook.EventSessionEnd, hook.Payload{
+			"event": "SessionEnd",
+		})
 	}
 }
 

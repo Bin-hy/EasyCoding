@@ -92,3 +92,27 @@ func (r *Registry) PrefixMatch(prefix string) []*Command {
 	}
 	return result
 }
+
+// RemoveNames 按名称列表删除命令。用于 skill reload 时清理旧命令。
+func (r *Registry) RemoveNames(names []string) {
+	removeSet := make(map[string]bool, len(names))
+	for _, n := range names {
+		removeSet[strings.ToLower(n)] = true
+	}
+
+	// 重建 byName
+	for key := range r.byName {
+		if removeSet[key] {
+			delete(r.byName, key)
+		}
+	}
+
+	// 重建 visible
+	filtered := make([]*Command, 0, len(r.visible))
+	for _, c := range r.visible {
+		if !removeSet[strings.ToLower(c.Name)] {
+			filtered = append(filtered, c)
+		}
+	}
+	r.visible = filtered
+}

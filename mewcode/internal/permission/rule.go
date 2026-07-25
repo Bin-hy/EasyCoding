@@ -1,14 +1,24 @@
 package permission
 
 import (
+	"fmt"
 	"strings"
 )
 
 // Rule 单条权限规则：工具名(模式) → allow 或 deny。
+//
+// 匹配语法升级（v2）：
+//   - "=value"  → 精确匹配（整串相等）
+//   - "~regex"  → 正则匹配
+//   - "!inner"  → 反向匹配（对内层 Matcher 取反，支持 !=value、!~regex、!glob）
+//   - "value"   → glob 通配（缺省类型，向后兼容）
+//
+// Matcher 为 nil 表示匹配该工具全部调用（pattern 为空串）。
 type Rule struct {
-	Tool    string // 友好名：Bash/Read/Write/Edit/Glob/Grep
-	Pattern string // 模式段；"" 表示匹配该工具全部调用
-	Allow   bool   // true=allow，false=deny
+	Tool    string  // 友好名：Bash/Read/Write/Edit/Glob/Grep
+	Matcher Matcher // 编译后的匹配器；nil 表示全匹配
+	Allow   bool    // true=allow，false=deny
+	raw     string  // 原始模式串，供错误日志与调试
 }
 
 // RuleSet 单层规则集（一个配置文件或会话内存）。
@@ -18,11 +28,14 @@ type RuleSet struct {
 }
 
 // parseRule 解析 "Tool(pattern)" 或 "Tool" 格式的规则字符串。
-// 返回 (Rule, true) 表示解析成功，(Rule{}, false) 表示格式非法。
-func parseRule(s string) (Rule, bool) {
+//
+// 返回 (Rule, error)；error 非 nil 表示解析或 Matcher 编译失败。
+// 格式非法（括号不配对等）返回 error；Matcher 编译失败（如非法正则）也返回 error。
+// 成功时 Rule.Tool 非空，Rule.Matcher 非 nil 除非 pattern 为空（全匹配）。
+func parseRule(s string) (Rule, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
-		return Rule{}, false
+		return Rule{}, fmt.Errorf("empty rule string")
 	}
 
 	// 查找括号位置
@@ -32,7 +45,7 @@ func parseRule(s string) (Rule, bool) {
 	var tool, pattern string
 
 	if parenOpen == -1 && parenClose == -1 {
-		// 不带模式：Tool
+		// 不带模式：Tool → 匹配该工具全部调用
 		tool = s
 		pattern = ""
 	} else if parenOpen > 0 && parenClose > parenOpen && parenClose == len(s)-1 {
@@ -41,31 +54,52 @@ func parseRule(s string) (Rule, bool) {
 		pattern = s[parenOpen+1 : parenClose]
 	} else {
 		// 括号不配对
-		return Rule{}, false
+		return Rule{}, fmt.Errorf("invalid rule format: %s", s)
 	}
 
 	if tool == "" {
-		return Rule{}, false
+		return Rule{}, fmt.Errorf("empty tool name in rule: %s", s)
 	}
 
-	return Rule{Tool: tool, Pattern: pattern}, true
+	// 空 pattern → nil Matcher（全匹配）
+	if pattern == "" {
+		return Rule{Tool: tool, raw: pattern}, nil
+	}
+
+	// 编译 Matcher：Bash 工具走命令串 glob，其它走文件路径 glob
+	isCommand := tool == "Bash"
+	m, err := CompileMatcher(pattern, isCommand)
+	if err != nil {
+		return Rule{}, fmt.Errorf("rule %q parse failed: %w", s, err)
+	}
+
+	return Rule{Tool: tool, Matcher: m, raw: pattern}, nil
 }
 
 // parseRuleWithAllow 解析规则字符串并指定 allow/deny。
-func parseRuleWithAllow(s string, allow bool) (Rule, bool) {
-	r, ok := parseRule(s)
-	if !ok {
-		return r, false
+func parseRuleWithAllow(s string, allow bool) (Rule, error) {
+	r, err := parseRule(s)
+	if err != nil {
+		return Rule{}, err
 	}
 	r.Allow = allow
-	return r, ok
+	return r, nil
 }
 
-// matchPattern 对目标串做模式匹配。
+// matchRule 对单条规则的目标串做匹配。
+// r.Matcher == nil 表示全匹配（恒返回 true）。
+func matchRule(r Rule, target string) bool {
+	if r.Matcher == nil {
+		return true
+	}
+	return r.Matcher.Match(target)
+}
+
+// matchPattern 对目标串做模式匹配（底层函数，供 matcherGlob 内部调用）。
 //
-// - pattern=="" 恒匹配（全匹配）。
-// - 命令串（isFile=false）：* 匹配任意字符序列（含空格），** 等价于 *，其余字符逐字比对。
-// - 文件路径（isFile=true）：按 / 分段匹配，* 匹配段内任意字符，** 跨任意层级。
+//   - pattern=="" 恒匹配（全匹配）。
+//   - 命令串（isFile=false）：* 匹配任意字符序列（含空格），** 等价于 *，其余字符逐字比对。
+//   - 文件路径（isFile=true）：按 / 分段匹配，* 匹配段内任意字符，** 跨任意层级。
 func matchPattern(pattern, target string, isFile bool) bool {
 	if pattern == "" {
 		return true
@@ -201,14 +235,14 @@ func matchSegment(pattern, name string) (bool, error) {
 func (rs RuleSet) match(friendly, target string, isFile bool) (Decision, bool) {
 	// deny 优先
 	for _, r := range rs.deny {
-		if r.Tool == friendly && matchPattern(r.Pattern, target, isFile) {
+		if r.Tool == friendly && matchRule(r, target) {
 			return Deny, true
 		}
 	}
 
 	// allow
 	for _, r := range rs.allow {
-		if r.Tool == friendly && matchPattern(r.Pattern, target, isFile) {
+		if r.Tool == friendly && matchRule(r, target) {
 			return Allow, true
 		}
 	}

@@ -17,11 +17,13 @@ import (
 	"mewcode/internal/command"
 	"mewcode/internal/config"
 	"mewcode/internal/conversation"
+	"mewcode/internal/hook"
 	"mewcode/internal/llm"
 	"mewcode/internal/memory"
 	"mewcode/internal/permission"
 	"mewcode/internal/prompt"
 	"mewcode/internal/session"
+	"mewcode/internal/skills"
 	"mewcode/internal/tool"
 )
 
@@ -93,6 +95,14 @@ type Model struct {
 	pendingPrintln []string          // handler 的 Println/Error 缓冲
 	pendingCmd     tea.Cmd           // handler 请求的异步操作
 
+	// Skill 系统
+	skillCatalog  *skills.Catalog            // Skill 目录
+	skillExecutor *skills.Executor           // Skill 执行器
+	skillDeps     *command.SkillCommandDeps  // /skill 命令依赖
+
+	// Hook 系统
+	hookEngine *hook.Engine // Hook 事件分派引擎
+
 	cwd    string // 当前工作目录
 	width  int
 	height int
@@ -119,7 +129,7 @@ func newRenderer(width int) *glamour.TermRenderer {
 }
 
 // New 创建 TUI Model。
-func New(providers []config.ProviderConfig, version string, registry *tool.Registry, engine *permission.Engine, runtime *agent.SessionRuntime, writer *session.Writer, memMgr *memory.Manager, instructionText, memoryText string) *Model {
+func New(providers []config.ProviderConfig, version string, registry *tool.Registry, engine *permission.Engine, runtime *agent.SessionRuntime, writer *session.Writer, memMgr *memory.Manager, instructionText, memoryText string, hookEngine *hook.Engine) *Model {
 	if len(providers) == 0 {
 		providers = []config.ProviderConfig{{Name: "default", Protocol: "anthropic", Model: "unknown"}}
 	}
@@ -146,6 +156,11 @@ func New(providers []config.ProviderConfig, version string, registry *tool.Regis
 	cmdReg := command.New()
 	command.RegisterBuiltins(cmdReg)
 
+	// 初始化 Skill 系统
+	cat := skills.LoadCatalog(cwd)
+	activeSkills := skills.NewActiveSkills()
+	runtime.ActiveSkills = activeSkills
+
 	m := &Model{
 		textarea:        ta,
 		spinner:         sp,
@@ -164,6 +179,7 @@ func New(providers []config.ProviderConfig, version string, registry *tool.Regis
 		memoryText:      memoryText,
 		sessionsDir:     sessionsDir,
 		cmdRegistry:     cmdReg,
+		skillCatalog:    cat,
 		cwd:             cwd,
 	}
 
@@ -175,8 +191,11 @@ func New(providers []config.ProviderConfig, version string, registry *tool.Regis
 			m.provider = p
 		}
 		m.state = stateIdle
-		// 构造常驻 Agent（含记忆管理器）
-		opts := []agent.Option{agent.WithRuntime(runtime)}
+		// 构造常驻 Agent（含记忆管理器、Skill Catalog）
+		opts := []agent.Option{agent.WithRuntime(runtime), agent.WithCatalog(cat)}
+		if hookEngine != nil {
+			opts = append(opts, agent.WithHookEngine(hookEngine))
+		}
 		if memMgr != nil {
 			opts = append(opts, agent.WithMemoryManager(memMgr))
 		}
@@ -187,6 +206,45 @@ func New(providers []config.ProviderConfig, version string, registry *tool.Regis
 			opts = append(opts, agent.WithMemoryText(memoryText))
 		}
 		m.ag = agent.New(m.provider, m.registry, m.version, m.engine, opts...)
+
+		// 构造 Skill 执行器（Agent 实现 SkillHost）
+		m.hookEngine = hookEngine
+		if runtime != nil {
+			runtime.HookEngine = hookEngine
+		}
+		m.skillExecutor = skills.NewExecutor(cat, m.ag)
+
+		// 注册 Skill 命令（返回已注册名称列表）
+		command.RegisterSkillsAsCommands(cmdReg, cat, m.skillExecutor)
+
+		// 注册 LoadSkillTool（系统工具，始终可见）
+		loadTool := tool.NewLoadSkillTool(m.skillExecutor)
+		registry.Register(loadTool)
+
+		// 注册 InstallSkillTool（普通工具，受权限约束）
+		installTool := tool.NewInstallSkillTool(cwd, cat, func(name string) {
+			// OnInstalled 回调：安装后重新注册所有 Skill 命令
+			command.RegisterSkillsAsCommands(cmdReg, cat, m.skillExecutor)
+		})
+		registry.Register(installTool)
+
+		// 校验工具白名单
+		issues := cat.ValidateTools(func(name string) bool {
+			_, ok := registry.Get(name)
+			return ok
+		})
+		for _, issue := range issues {
+			fmt.Fprintf(os.Stderr, "[skills] warn: Skill %q 引用了不存在的工具 %q\n", issue.Skill, issue.Tool)
+		}
+
+		// 注册 /skill 命令
+		m.skillDeps = &command.SkillCommandDeps{
+			Catalog:  cat,
+			Executor: m.skillExecutor,
+			WorkDir:  cwd,
+			CmdReg:   cmdReg,
+		}
+		command.RegisterSkillCmd(cmdReg, m.skillDeps)
 	} else {
 		m.state = stateSelecting
 		m.initList()
@@ -205,6 +263,10 @@ func (m *Model) Init() tea.Cmd {
 	if m.state == stateSelecting {
 		return tea.Println(banner)
 	}
+
+	// Hook: SessionStart
+	m.dispatchSessionStart()
+
 	return tea.Batch(
 		tea.Println(banner),
 		m.textarea.Focus(),
@@ -520,6 +582,12 @@ func (m *Model) handleIdleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 // submitMessage 提交用户消息并通过 agent 发起流式请求。
 func (m *Model) submitMessage(text string) (tea.Model, tea.Cmd) {
+	// Hook: UserPromptSubmit 拦截检查
+	if blocked, reason, hookName := m.dispatchUserPromptSubmit(text); blocked {
+		blockMsg := fmt.Sprintf("[hook %s] %s", hookName, reason)
+		return m, tea.Println(renderErrorBlock(blockMsg))
+	}
+
 	m.conv.AddUser(text)
 
 	// 启动 per-turn 上下文

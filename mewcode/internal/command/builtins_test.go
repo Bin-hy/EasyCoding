@@ -1,6 +1,7 @@
 package command
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -12,12 +13,12 @@ func TestRegisterBuiltins_AllRegistered(t *testing.T) {
 	RegisterBuiltins(r)
 
 	visible := r.Visible()
-	if len(visible) != 12 {
-		t.Fatalf("RegisterBuiltins 应注册 12 条可见命令，实际: %d", len(visible))
+	if len(visible) != 13 {
+		t.Fatalf("RegisterBuiltins 应注册 13 条可见命令，实际: %d", len(visible))
 	}
 
 	expectedNames := []string{
-		"clear", "compact", "do", "exit", "help", "memory",
+		"clear", "compact", "do", "exit", "help", "hooks", "memory",
 		"permission", "plan", "resume", "review", "session", "status",
 	}
 	for i, name := range expectedNames {
@@ -31,8 +32,8 @@ func TestRegisterBuiltins_NoCollision(t *testing.T) {
 	// 不应 panic
 	r := New()
 	RegisterBuiltins(r)
-	if len(r.Visible()) != 12 {
-		t.Fatal("注册后应恰好 12 条命令")
+	if len(r.Visible()) != 13 {
+		t.Fatal("注册后应恰好 13 条命令")
 	}
 }
 
@@ -94,7 +95,7 @@ func (r *recordingUI) Quit() {
 
 func TestHandleStatus_PrintsAllKeys(t *testing.T) {
 	rec := newRecordingUI()
-	_ = handleStatus(nil, rec)
+	_ = handleStatus(context.TODO(), rec)
 
 	if len(rec.printlnCalls) == 0 {
 		t.Fatal("handleStatus 应调用 Println")
@@ -110,7 +111,7 @@ func TestHandleStatus_PrintsAllKeys(t *testing.T) {
 
 func TestHandleDo_SetsModeAndInjects(t *testing.T) {
 	rec := newRecordingUI()
-	_ = handleDo(nil, rec)
+	_ = handleDo(context.TODO(), rec)
 
 	if len(rec.setModeCalls) != 1 || rec.setModeCalls[0] != permission.ModeDefault {
 		t.Error("handleDo 应调用 SetMode(ModeDefault)")
@@ -135,7 +136,7 @@ func TestHandleHelp_IncludesAllBuiltins(t *testing.T) {
 	}
 	text := rec.printlnCalls[0]
 	allNames := []string{
-		"/clear", "/compact", "/do", "/exit", "/help", "/memory",
+		"/clear", "/compact", "/do", "/exit", "/help", "/hooks", "/memory",
 		"/permission", "/plan", "/resume", "/review", "/session", "/status",
 	}
 	for _, name := range allNames {

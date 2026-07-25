@@ -32,7 +32,15 @@ func ruleFor(call llm.ToolCall) (Rule, string, bool) {
 	}
 
 	yamlStr := fmt.Sprintf("%s(%s)", friendly, pattern)
-	return Rule{Tool: friendly, Pattern: pattern, Allow: true}, yamlStr, true
+
+	// 编译 Matcher：转义后的 glob 模式按字面精确匹配
+	isCommand := friendly == "Bash"
+	m, err := CompileMatcher(pattern, isCommand)
+	if err != nil {
+		// escapeGlob 产生的模式不应编译失败（兜底用 glob 包装）
+		m = &matcherGlob{pattern: pattern, isCommand: isCommand}
+	}
+	return Rule{Tool: friendly, Matcher: m, Allow: true, raw: pattern}, yamlStr, true
 }
 
 // escapeGlob 转义命令串中的 glob 元字符，使规则匹配为字面匹配。
@@ -86,7 +94,7 @@ func (e *Engine) PersistLocalAllow(call llm.ToolCall) error {
 	}
 
 	// 同步更新内存
-	if r, ok := parseRuleWithAllow(yamlStr, true); ok {
+	if r, err := parseRuleWithAllow(yamlStr, true); err == nil {
 		e.local.allow = append(e.local.allow, r)
 	}
 

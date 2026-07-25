@@ -27,10 +27,11 @@ func AssembleSystem(mods []Module) string {
 
 // BuildSystemPrompt 返回完整的稳定系统提示。
 // instructions 非空时填入 custom-instructions 模块（priority 80）。
+// skillsCatalog 非空时填入 skills-catalog 模块（priority 90）。
 // memory 非空时填入 long-term-memory 模块（priority 100）。
 // 可选槽 Content 为空时自动跳过，不留多余空行。
-func BuildSystemPrompt(instructions, memory string) string {
-	all := append(FixedModules(), OptionalModules(instructions, memory)...)
+func BuildSystemPrompt(instructions, memory, skillsCatalog string) string {
+	all := append(FixedModules(), OptionalModules(instructions, memory, skillsCatalog)...)
 	return AssembleSystem(all)
 }
 

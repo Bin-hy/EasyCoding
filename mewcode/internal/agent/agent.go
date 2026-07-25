@@ -15,10 +15,12 @@ import (
 
 	"mewcode/internal/compact"
 	"mewcode/internal/conversation"
+	"mewcode/internal/hook"
 	"mewcode/internal/llm"
 	"mewcode/internal/memory"
 	"mewcode/internal/permission"
 	"mewcode/internal/prompt"
+	"mewcode/internal/skills"
 	"mewcode/internal/tool"
 )
 
@@ -94,8 +96,10 @@ type Agent struct {
 	eng             *permission.Engine // 权限引擎（前四层判定 + 配置）
 	runtime         *SessionRuntime    // 跨 Run 复用的长生命周期状态
 	memMgr          *memory.Manager    // 可选：记忆更新管理器
+	catalog         *skills.Catalog    // 可选：Skill 目录（用于第一阶段列表与 ClearActiveSkills）
 	instructionText string             // 项目指令文本（注入系统提示）
 	memoryText      string             // 记忆索引文本（注入系统提示）
+	hookEngine      *hook.Engine       // Hook 事件分派引擎
 	runMu           sync.Mutex         // 保证 Run 与 RunForceCompact 不并发
 	running         int32              // 原子标记：是否正在执行 Run
 }
@@ -115,6 +119,21 @@ func New(p llm.Provider, r *tool.Registry, version string, eng *permission.Engin
 		a.runtime = &SessionRuntime{ContextWindow: 200000}
 	}
 	return a
+}
+
+// ActivateSkill 激活一个 Skill，将 name + body 钉到 env context。
+// 每轮 Agent Loop 重建时注入。同名重复激活会覆盖原位置。
+func (a *Agent) ActivateSkill(name, body string) {
+	if a.runtime != nil && a.runtime.ActiveSkills != nil {
+		a.runtime.ActiveSkills.Activate(name, body)
+	}
+}
+
+// ClearActiveSkills 清空所有已激活 Skill。
+func (a *Agent) ClearActiveSkills() {
+	if a.runtime != nil && a.runtime.ActiveSkills != nil {
+		a.runtime.ActiveSkills.Clear()
+	}
 }
 
 // 迭代与停止常量（内置，不可配）
@@ -151,8 +170,18 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode p
 
 		// 采集环境信息与装配稳定系统提示（Run 起始一次，跨轮复用）
 		env := prompt.GatherEnvironment(a.version, a.provider.Model())
-		sys := prompt.BuildSystemPrompt(a.instructionText, a.memoryText)
-		envText := env.Render()
+
+		// Skill catalog 注入第一阶段 system prompt
+		var skillsCatalogText string
+		if a.catalog != nil {
+			items := a.catalog.ToPromptItems()
+			promptItems := make([]prompt.SkillCatalogItem, len(items))
+			for i, item := range items {
+				promptItems[i] = prompt.SkillCatalogItem{Name: item.Name, Description: item.Description}
+			}
+			skillsCatalogText = prompt.RenderSkillsCatalog(promptItems)
+		}
+		sys := prompt.BuildSystemPrompt(a.instructionText, a.memoryText, skillsCatalogText)
 		unknownRun := 0
 
 		for iter := 1; iter <= maxIterations; iter++ {
@@ -195,12 +224,19 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode p
 			// 判断是否需要自动压缩（预估超出阈值）
 			willSummarize := est >= int64(cw-compact.SummaryReserve-compact.AutoSafetyMargin)
 			if willSummarize {
+				a.dispatchHook(ctx, hook.EventPreCompact, a.basePayload(hook.EventPreCompact, mode))
 				emit(ctx, ch, Event{Compact: &CompactEvent{Phase: CompactPhaseBeforeAuto}})
 			}
 
 			out, mcErr := compact.ManageContext(ctx, in)
 
 			if willSummarize {
+				a.dispatchHook(ctx, hook.EventPostCompact, hook.Payload{
+					"event":         "PostCompact",
+					"trigger":       "auto",
+					"before_tokens": out.BeforeTokens,
+					"after_tokens":  out.AfterTokens,
+				})
 				emit(ctx, ch, Event{Compact: &CompactEvent{
 					Phase: CompactPhaseAfterAuto, Before: out.BeforeTokens, After: out.AfterTokens, Err: mcErr,
 				}})
@@ -212,11 +248,23 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode p
 			}
 			// ---------- 上下文管理结束 ----------
 
-			// 按轮次计算规划模式 reminder
-			var reminder string
-			if mode == permission.ModePlan {
-				full := iter == 1 || (iter-1)%planReminderInterval == 0
-				reminder = prompt.PlanReminder(full)
+			// 按轮次计算 plannereminder + hook 注入
+			reminder := a.buildReminder(mode, iter)
+
+			// Hook: PreUserMessage（每轮 stream 之前）
+			a.dispatchHook(ctx, hook.EventPreUserMessage, a.basePayload(hook.EventPreUserMessage, mode))
+
+			// 构建环境文本（每轮重建以反映活跃 Skill 变更）
+			envText := env.Render()
+			if a.runtime != nil && a.runtime.ActiveSkills != nil {
+				entries := a.runtime.ActiveSkills.ToPromptEntries()
+				if len(entries) > 0 {
+					promptEntries := make([]prompt.ActiveSkillEntry, len(entries))
+					for i, e := range entries {
+						promptEntries[i] = prompt.ActiveSkillEntry{Name: e.Name, Body: e.Body}
+					}
+					envText = envText + "\n\n" + prompt.RenderActiveSkillsBlock(promptEntries)
+				}
 			}
 
 			// 流式请求本轮
@@ -260,6 +308,11 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode p
 				return
 			}
 			if sErr != nil {
+				a.dispatchHook(ctx, hook.EventNotification, hook.Payload{
+					"event":  "Notification",
+					"kind":   "stream_error",
+					"detail": sErr.Error(),
+				})
 				emit(ctx, ch, Event{Err: sErr})
 				ensureAssistantTail(conv, noticeStreamErr)
 				return
@@ -294,6 +347,11 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode p
 					}
 				}
 
+				// Hook: Stop 事件
+				a.dispatchHook(ctx, hook.EventStop, hook.Payload{
+					"event": "Stop",
+					"iter":  iter,
+				})
 				emit(ctx, ch, Event{Done: true})
 				return
 			}
@@ -327,6 +385,7 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode p
 			if unknownRun >= maxUnknownRun {
 				emit(ctx, ch, Event{Notice: noticeUnknownTools})
 				ensureAssistantTail(conv, noticeUnknownTools)
+				a.dispatchHook(ctx, hook.EventStop, hook.Payload{"event": "Stop", "iter": iter})
 				emit(ctx, ch, Event{Done: true})
 				return
 			}
@@ -335,6 +394,7 @@ func (a *Agent) Run(ctx context.Context, conv *conversation.Conversation, mode p
 		// 触达迭代上限
 		emit(ctx, ch, Event{Notice: noticeMaxIter})
 		ensureAssistantTail(conv, noticeMaxIter)
+		a.dispatchHook(ctx, hook.EventStop, hook.Payload{"event": "Stop", "iter": maxIterations})
 		emit(ctx, ch, Event{Done: true})
 	}()
 
@@ -472,9 +532,23 @@ func (a *Agent) executeBatched(ctx context.Context, calls []llm.ToolCall, mode p
 				j++
 			}
 
-			// 权限检查：逐个 Check，标记被拒项
+			// 权限检查：逐个 Check，标记被拒项；同时派发 PreToolUse hook
 			preDenied := make(map[int]string) // idx → deny reason
 			for k := i; k < j; k++ {
+				// Hook: PreToolUse（权限 Check 之前）
+				toolInput := make(map[string]any)
+				json.Unmarshal(calls[k].Input, &toolInput)
+				hr := a.dispatchHook(ctx, hook.EventPreToolUse, hook.Payload{
+					"event":      "PreToolUse",
+					"tool_name":  calls[k].Name,
+					"tool_input": toolInput,
+				})
+				if hr.Blocked {
+					results[k] = hookBlockedResult(calls[k].ID, hr.BlockingHookName, hr.Reason)
+					preDenied[k] = fmt.Sprintf("[hook %s] %s", hr.BlockingHookName, hr.Reason)
+					continue
+				}
+
 				d, reason := a.eng.Check(mode, calls[k], true)
 				if d == permission.Deny {
 					preDenied[k] = reason
@@ -534,7 +608,7 @@ func (a *Agent) executeBatched(ctx context.Context, calls []llm.ToolCall, mode p
 			}
 			wg.Wait()
 
-			// 再按原始顺序 emit End 事件（含被拒项）
+			// 再按原始顺序 emit End 事件（含被拒项）+ PostToolUse hook
 			for k := i; k < j; k++ {
 				result := results[k]
 				argsPreview := argPreview(calls[k].Input)
@@ -558,12 +632,73 @@ func (a *Agent) executeBatched(ctx context.Context, calls []llm.ToolCall, mode p
 					}
 					return results, false
 				}
+
+				// Hook: PostToolUse
+				toolInput := make(map[string]any)
+				json.Unmarshal(calls[k].Input, &toolInput)
+				a.dispatchHook(ctx, hook.EventPostToolUse, hook.Payload{
+					"event":       "PostToolUse",
+					"tool_name":   calls[k].Name,
+					"tool_input":  toolInput,
+					"tool_result": resultSummary,
+					"is_error":    result.IsError,
+				})
 			}
 			i = j
 		} else {
 			// 串行执行单个有副作用工具（含权限判定 + 人在回路）
 			call := calls[i]
 			argsPreview := argPreview(call.Input)
+
+			// Hook: PreToolUse（权限 Check 之前）
+			toolInput := make(map[string]any)
+			json.Unmarshal(call.Input, &toolInput)
+			hr := a.dispatchHook(ctx, hook.EventPreToolUse, hook.Payload{
+				"event":      "PreToolUse",
+				"tool_name":  call.Name,
+				"tool_input": toolInput,
+			})
+			if hr.Blocked {
+				if !emit(ctx, ch, Event{Tool: &ToolEvent{
+					Name:  call.Name,
+					Args:  argsPreview,
+					Phase: PhaseStart,
+				}}) {
+					for m := i; m < len(calls); m++ {
+						if results[m].ToolCallID == "" {
+							results[m] = llm.ToolResult{
+								ToolCallID: calls[m].ID,
+								Content:    noticeCancelled,
+								IsError:    true,
+							}
+						}
+					}
+					return results, false
+				}
+
+				results[i] = hookBlockedResult(call.ID, hr.BlockingHookName, hr.Reason)
+				reason := fmt.Sprintf("[hook %s] %s", hr.BlockingHookName, hr.Reason)
+				if !emit(ctx, ch, Event{Tool: &ToolEvent{
+					Name:    call.Name,
+					Args:    argsPreview,
+					Phase:   PhaseEnd,
+					Result:  reason,
+					IsError: true,
+				}}) {
+					for m := i + 1; m < len(calls); m++ {
+						if results[m].ToolCallID == "" {
+							results[m] = llm.ToolResult{
+								ToolCallID: calls[m].ID,
+								Content:    noticeCancelled,
+								IsError:    true,
+							}
+						}
+					}
+					return results, false
+				}
+				i++
+				continue
+			}
 
 			// 前四层判定
 			d, reason := a.eng.Check(mode, call, false)
@@ -897,4 +1032,66 @@ func hasMemorySignal(msgs []llm.Message) bool {
 		}
 	}
 	return false
+}
+
+// ─── Hook 系统集成 ──────────────────────────────────────
+
+// dispatchHook 向 Hook 引擎派发事件。
+// hookEngine 为 nil 时返回空 DispatchResult。
+func (a *Agent) dispatchHook(ctx context.Context, event hook.Event, payload hook.Payload) hook.DispatchResult {
+	if a.hookEngine == nil {
+		return hook.DispatchResult{}
+	}
+	result := a.hookEngine.Dispatch(ctx, event, payload)
+	if a.runtime != nil && len(result.InjectedPrompts) > 0 {
+		a.runtime.AppendReminders(result.InjectedPrompts)
+	}
+	return result
+}
+
+// basePayload 构造包含通用字段的 Payload。
+func (a *Agent) basePayload(event hook.Event, mode permission.Mode) hook.Payload {
+	sessionID := ""
+	cwd, _ := os.Getwd()
+	if a.runtime != nil && a.runtime.Session != nil {
+		sessionID = ""
+		_ = sessionID // TODO: 对接 Session 的 ID 字段
+	}
+	return hook.Payload{
+		"event":      string(event),
+		"session_id": sessionID,
+		"cwd":        cwd,
+		"mode":       mode.String(),
+	}
+}
+
+// buildReminder 构造本轮 reminder：plan reminder + hook 注入的 pending reminders。
+func (a *Agent) buildReminder(mode permission.Mode, iter int) string {
+	var parts []string
+
+	if mode == permission.ModePlan {
+		full := iter == 1 || (iter-1)%planReminderInterval == 0
+		if r := prompt.PlanReminder(full); r != "" {
+			parts = append(parts, r)
+		}
+	}
+
+	if a.runtime != nil {
+		for _, r := range a.runtime.TakeReminders() {
+			if r != "" {
+				parts = append(parts, r)
+			}
+		}
+	}
+
+	return strings.Join(parts, "\n\n")
+}
+
+// hookBlockedResult 构造 Hook 拦截产生的工具结果。
+func hookBlockedResult(callID, hookName, reason string) llm.ToolResult {
+	return llm.ToolResult{
+		ToolCallID: callID,
+		Content:    fmt.Sprintf("[hook %s] %s", hookName, reason),
+		IsError:    true,
+	}
 }
