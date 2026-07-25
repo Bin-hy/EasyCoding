@@ -5,7 +5,9 @@ import (
 
 	"mewcode/internal/compact"
 	"mewcode/internal/hook"
+	"mewcode/internal/llm"
 	"mewcode/internal/memory"
+	"mewcode/internal/permission"
 	"mewcode/internal/skills"
 )
 
@@ -123,6 +125,59 @@ func WithCatalog(c *skills.Catalog) Option {
 func WithHookEngine(e *hook.Engine) Option {
 	return func(a *Agent) {
 		a.hookEngine = e
+	}
+}
+
+// WithSystemPrompt 注入子 Agent 角色系统提示，覆盖默认 mewcode 主 Agent 系统提示（spec F10）。
+func WithSystemPrompt(text string) Option {
+	return func(a *Agent) {
+		a.systemPrompt = text
+	}
+}
+
+// WithMaxTurns 限制本 Agent 的最大迭代轮数（spec F10）。
+// n<=0 时忽略（沿用全局 maxIterations）。
+func WithMaxTurns(n int) Option {
+	return func(a *Agent) {
+		if n > 0 {
+			a.maxTurns = n
+		}
+	}
+}
+
+// WithPermissionMode 设置子 Agent 的权限模式（spec F10）。
+func WithPermissionMode(m permission.Mode) Option {
+	return func(a *Agent) {
+		a.permissionMode = m
+		a.permissionModeSet = true
+	}
+}
+
+// WithDontAsk 设置子 Agent dontAsk 模式——自动批准所有规则未命中的工具（spec F10）。
+func WithDontAsk(enabled bool) Option {
+	return func(a *Agent) {
+		a.dontAsk = enabled
+	}
+}
+
+// WithApprovalUpgrader 设置子 Agent 审批升级到父 TUI 的回调（spec F10）。
+func WithApprovalUpgrader(fn ApprovalUpgrader) Option {
+	return func(a *Agent) {
+		a.approvalUpgrader = fn
+	}
+}
+
+// WithProvider 覆盖 Agent 的 LLM Provider（spec F10）。
+func WithProvider(p llm.Provider) Option {
+	return func(a *Agent) {
+		a.provider = p
+	}
+}
+
+// WithAllowedTools 注入工具白名单（子 Agent 专用；非空时限制工具集）。
+func WithAllowedTools(allowed []string) Option {
+	return func(a *Agent) {
+		a.allowedTools = allowed
 	}
 }
 

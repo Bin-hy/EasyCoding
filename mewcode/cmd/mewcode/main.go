@@ -18,6 +18,8 @@ import (
 	"mewcode/internal/permission"
 	"mewcode/internal/session"
 	"mewcode/internal/tool"
+	"mewcode/internal/subagent"
+	"mewcode/internal/task"
 	"mewcode/internal/tui"
 )
 
@@ -126,8 +128,15 @@ func main() {
 	}
 	conv := conversation.NewWithHooks(writer.OnAppend(modelName), writer.OnReplace())
 
+	// --- ch13: 加载 SubAgent 角色目录 ---
+	subagentCatalog := subagent.LoadCatalog(root)
+	fmt.Fprintf(os.Stderr, "[subagent] 已加载 %d 个 Agent 角色\n", len(subagentCatalog.List()))
+
+	// --- ch13: 创建后台任务管理器 ---
+	taskMgr := task.NewManager()
+
 	// 启动 TUI
-	m := tui.New(cfg.Providers, version, reg, eng, runtime, writer, memMgr, instructionText, memoryText, hookEngine)
+	m := tui.New(cfg.Providers, version, reg, eng, runtime, writer, memMgr, instructionText, memoryText, hookEngine, taskMgr, subagentCatalog)
 	// 注入带回调的 Conversation（覆盖 TUI 内部创建的空 Conversation）
 	m.SetConversation(conv)
 

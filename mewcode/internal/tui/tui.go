@@ -24,6 +24,8 @@ import (
 	"mewcode/internal/prompt"
 	"mewcode/internal/session"
 	"mewcode/internal/skills"
+	"mewcode/internal/subagent"
+	"mewcode/internal/task"
 	"mewcode/internal/tool"
 )
 
@@ -103,6 +105,11 @@ type Model struct {
 	// Hook 系统
 	hookEngine *hook.Engine // Hook 事件分派引擎
 
+	// SubAgent 系统（ch13）
+	taskMgr         *task.Manager     // 后台任务管理器
+	subAgentCatalog *subagent.Catalog // Agent 角色目录
+	agentTool       *agent.AgentTool  // Agent 工具实例
+
 	cwd    string // 当前工作目录
 	width  int
 	height int
@@ -129,7 +136,7 @@ func newRenderer(width int) *glamour.TermRenderer {
 }
 
 // New 创建 TUI Model。
-func New(providers []config.ProviderConfig, version string, registry *tool.Registry, engine *permission.Engine, runtime *agent.SessionRuntime, writer *session.Writer, memMgr *memory.Manager, instructionText, memoryText string, hookEngine *hook.Engine) *Model {
+func New(providers []config.ProviderConfig, version string, registry *tool.Registry, engine *permission.Engine, runtime *agent.SessionRuntime, writer *session.Writer, memMgr *memory.Manager, instructionText, memoryText string, hookEngine *hook.Engine, taskMgr *task.Manager, subAgentCatalog *subagent.Catalog) *Model {
 	if len(providers) == 0 {
 		providers = []config.ProviderConfig{{Name: "default", Protocol: "anthropic", Model: "unknown"}}
 	}
@@ -180,6 +187,8 @@ func New(providers []config.ProviderConfig, version string, registry *tool.Regis
 		sessionsDir:     sessionsDir,
 		cmdRegistry:     cmdReg,
 		skillCatalog:    cat,
+		taskMgr:         taskMgr,
+		subAgentCatalog: subAgentCatalog,
 		cwd:             cwd,
 	}
 
@@ -245,6 +254,23 @@ func New(providers []config.ProviderConfig, version string, registry *tool.Regis
 			CmdReg:   cmdReg,
 		}
 		command.RegisterSkillCmd(cmdReg, m.skillDeps)
+
+			// ch13: 注册 task 工具（spec F20）
+			if taskMgr != nil {
+				registry.Register(task.NewTaskListTool(taskMgr))
+				registry.Register(task.NewTaskGetTool(taskMgr))
+				registry.Register(task.NewTaskStopTool(taskMgr))
+				registry.Register(task.NewSendMessageTool(taskMgr))
+			}
+
+			// ch13: 注册 Agent 工具（spec F1-F3）
+			if subAgentCatalog != nil && taskMgr != nil {
+				bgEnabled := true // 默认启用后台；后续可从 config 读取
+				agentTool := agent.NewAgentTool(subAgentCatalog, taskMgr, m.ag, bgEnabled)
+				agentTool.SetParentConvFn(m.conv.Messages)
+				registry.Register(agentTool)
+				m.agentTool = agentTool
+			}
 	} else {
 		m.state = stateSelecting
 		m.initList()
@@ -266,6 +292,11 @@ func (m *Model) Init() tea.Cmd {
 
 	// Hook: SessionStart
 	m.dispatchSessionStart()
+
+	// ch13: 启动后台任务完成通知消费（spec F19）
+	if m.taskMgr != nil {
+		go m.consumeTaskDone()
+	}
 
 	return tea.Batch(
 		tea.Println(banner),
