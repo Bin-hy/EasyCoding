@@ -9,6 +9,7 @@ func RegisterBuiltins(reg *Registry) {
 	reg.Register(&Command{Name: "do", Description: "切回默认模式并执行计划", Kind: KindPrompt, Handler: handleDo})
 	reg.Register(&Command{Name: "exit", Description: "退出 MewCode", Kind: KindUI, Handler: handleExit})
 	reg.Register(&Command{Name: "help", Description: "显示所有可用命令", Kind: KindLocal, Handler: handleHelp(reg)})
+	reg.Register(&Command{Name: "hooks", Description: "列出已加载的 hook 列表", Kind: KindLocal, Handler: handleHooks})
 	reg.Register(&Command{Name: "memory", Description: "显示已加载的记忆文件列表", Kind: KindLocal, Handler: handleMemory})
 	reg.Register(&Command{Name: "permission", Description: "显示当前权限模式", Kind: KindLocal, Handler: handlePermission})
 	reg.Register(&Command{Name: "plan", Description: "切换到计划模式（只读工具）", Kind: KindUI, Handler: handlePlan})

@@ -39,6 +39,10 @@ type UI interface {
 	// Skill 相关
 	AppendAssistantMessage(text string) // fork 模式：将子 Agent 结果写入主对话历史
 	ClearActiveSkills()                 // /clear 时清空已激活 Skill
+
+	// Hook 相关
+	HookSources() []string
+	HookRules() []interface{}
 }
 
 // nopUI 测试桩：吞掉所有写入调用，查询返回零值。
@@ -69,3 +73,5 @@ func (n *nopUI) ClearAndNewSession()                             {}
 func (n *nopUI) Idle() bool                                      { return true }
 func (n *nopUI) AppendAssistantMessage(text string)              {}
 func (n *nopUI) ClearActiveSkills()                               {}
+func (n *nopUI) HookSources() []string                            { return nil }
+func (n *nopUI) HookRules() []interface{}                         { return nil }

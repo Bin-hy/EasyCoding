@@ -116,6 +116,9 @@ func (m *Model) OpenResumeMenu() {
 }
 
 func (m *Model) ClearAndNewSession() {
+	// Hook: SessionEnd（旧会话）
+	m.dispatchSessionEnd()
+
 	// a. 关闭旧 writer
 	if m.writer != nil {
 		_ = m.writer.Close()
@@ -148,6 +151,9 @@ func (m *Model) ClearAndNewSession() {
 	m.iter = 0
 	m.usageIn = 0
 	m.usageOut = 0
+
+	// Hook: SessionStart（新会话）
+	m.dispatchSessionStart()
 }
 
 func (m *Model) InjectAndSend(label, preset string) {

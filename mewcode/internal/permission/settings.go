@@ -2,6 +2,7 @@ package permission
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -42,17 +43,21 @@ func loadSettings(path string) (Settings, error) {
 }
 
 // toRuleSet 将 Settings 中的 allow/deny 字符串转为 RuleSet。
-// 非法条目跳过（N5），不报错。
+// 非法条目跳过并在 stderr 输出错误信息（F4：原本静默跳过，现在有声跳过）。
 func toRuleSet(s Settings) RuleSet {
 	var rs RuleSet
 	for _, a := range s.Permissions.Allow {
-		if r, ok := parseRuleWithAllow(a, true); ok {
+		if r, err := parseRuleWithAllow(a, true); err == nil {
 			rs.allow = append(rs.allow, r)
+		} else {
+			fmt.Fprintf(os.Stderr, "rule %q parse failed: %s\n", a, err)
 		}
 	}
 	for _, d := range s.Permissions.Deny {
-		if r, ok := parseRuleWithAllow(d, false); ok {
+		if r, err := parseRuleWithAllow(d, false); err == nil {
 			rs.deny = append(rs.deny, r)
+		} else {
+			fmt.Fprintf(os.Stderr, "rule %q parse failed: %s\n", d, err)
 		}
 	}
 	return rs

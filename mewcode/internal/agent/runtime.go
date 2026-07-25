@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"mewcode/internal/compact"
+	"mewcode/internal/hook"
 	"mewcode/internal/memory"
 	"mewcode/internal/skills"
 )
@@ -20,7 +21,12 @@ type SessionRuntime struct {
 	AnchorMsgLen  int        // anchor 当时 Conversation.Len()
 	TurnCount     int        // 会话轮次计数（用于记忆更新触发）
 	ActiveSkills  *skills.ActiveSkills // 已激活 Skill 列表（跨轮保持）
-	mu            sync.Mutex // 保护 UsageAnchor / AnchorMsgLen / TurnCount 的读写
+
+	// Hook 系统扩展
+	HookEngine       *hook.Engine // Hook 事件分派引擎
+	PendingReminders []string     // 待注入的 prompt 提醒文本（每轮取出后清空）
+
+	mu sync.Mutex // 保护 UsageAnchor / AnchorMsgLen / TurnCount / PendingReminders 的读写
 }
 
 // UpdateAnchor 更新 token 估算锚点。
@@ -55,7 +61,7 @@ func (r *SessionRuntime) IncTurn() int {
 }
 
 // ResetForNewSession 清空所有 compact 子状态、锚点和轮次计数，替换 Session 引用。
-// ContextWindow 保留不变。同时清空 ActiveSkills。
+// ContextWindow 保留不变。同时清空 ActiveSkills、PendingReminders，重置 Hook 引擎 only_once 集合。
 func (r *SessionRuntime) ResetForNewSession(sesCtx *compact.SessionContext) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -66,8 +72,12 @@ func (r *SessionRuntime) ResetForNewSession(sesCtx *compact.SessionContext) {
 	r.UsageAnchor = 0
 	r.AnchorMsgLen = 0
 	r.TurnCount = 0
+	r.PendingReminders = nil
 	if r.ActiveSkills != nil {
 		r.ActiveSkills.Clear()
+	}
+	if r.HookEngine != nil {
+		r.HookEngine.ResetForNewSession()
 	}
 }
 
@@ -107,4 +117,27 @@ func WithCatalog(c *skills.Catalog) Option {
 	return func(a *Agent) {
 		a.catalog = c
 	}
+}
+
+// WithHookEngine 注入 Hook 事件分派引擎。
+func WithHookEngine(e *hook.Engine) Option {
+	return func(a *Agent) {
+		a.hookEngine = e
+	}
+}
+
+// AppendReminders 追加待注入的提醒文本。
+func (r *SessionRuntime) AppendReminders(prompts []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.PendingReminders = append(r.PendingReminders, prompts...)
+}
+
+// TakeReminders 取出并清空所有待注入的提醒文本。
+func (r *SessionRuntime) TakeReminders() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	reminders := r.PendingReminders
+	r.PendingReminders = nil
+	return reminders
 }
