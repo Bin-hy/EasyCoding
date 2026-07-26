@@ -172,7 +172,7 @@ func (x *Executor) runHTTP(ctx context.Context, ha *HTTPAction, payload Payload,
 	if err != nil {
 		return ExecutionResult{Err: fmt.Errorf("http request failed: %w", err)}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// 拦截判定：2xx 且 body 含 {"decision":"block","reason":"..."}
 	if blocking && resp.StatusCode >= 200 && resp.StatusCode < 300 {

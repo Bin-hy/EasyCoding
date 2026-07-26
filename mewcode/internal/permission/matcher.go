@@ -88,12 +88,12 @@ func CompileMatcher(pattern string, isCommand bool) (Matcher, error) {
 		return nil, fmt.Errorf("empty matcher pattern")
 	}
 
-	switch {
-	case pattern[0] == '=':
+	switch pattern[0] {
+	case '=':
 		// 精确匹配：去除 = 前缀后匹配剩余串
 		return &matcherExact{value: pattern[1:]}, nil
 
-	case pattern[0] == '~':
+	case '~':
 		// 正则匹配：去除 ~ 前缀后编译正则
 		src := pattern[1:]
 		re, err := regexp.Compile(src)
@@ -102,7 +102,7 @@ func CompileMatcher(pattern string, isCommand bool) (Matcher, error) {
 		}
 		return &matcherRegex{re: re, src: src}, nil
 
-	case pattern[0] == '!':
+	case '!':
 		// 反向匹配：去除 ! 前缀后递归解析内层
 		inner, err := CompileMatcher(pattern[1:], isCommand)
 		if err != nil {

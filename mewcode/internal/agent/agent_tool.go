@@ -233,20 +233,3 @@ func (t *AgentTool) Execute(ctx context.Context, args json.RawMessage) tool.Resu
 
 	return tool.Result{Content: finalText}
 }
-
-// isSubAgentContext 检查 ctx 是否携带子 Agent 标记——防嵌套。
-func isSubAgentContext(ctx context.Context) bool {
-	v := ctx.Value(subAgentCtxKey{})
-	if v == nil {
-		return false
-	}
-	b, _ := v.(bool)
-	return b
-}
-
-// withSubAgentContext 标记 ctx 为子 Agent 上下文。
-func withSubAgentContext(ctx context.Context) context.Context {
-	return context.WithValue(ctx, subAgentCtxKey{}, true)
-}
-
-type subAgentCtxKey struct{}

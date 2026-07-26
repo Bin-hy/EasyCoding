@@ -11,7 +11,7 @@ import (
 func TestE2E_PreToolUseShellBlock(t *testing.T) {
 	dir := t.TempDir()
 	hookPath := filepath.Join(dir, ".mewcode", "hooks.yaml")
-	os.MkdirAll(filepath.Dir(hookPath), 0o755)
+	_ = os.MkdirAll(filepath.Dir(hookPath), 0o755)
 
 	yamlContent := `
 hooks:
@@ -55,7 +55,7 @@ hooks:
 func TestE2E_SessionStartPromptInject(t *testing.T) {
 	dir := t.TempDir()
 	hookPath := filepath.Join(dir, ".mewcode", "hooks.yaml")
-	os.MkdirAll(filepath.Dir(hookPath), 0o755)
+	_ = os.MkdirAll(filepath.Dir(hookPath), 0o755)
 
 	yamlContent := `
 hooks:
@@ -88,7 +88,7 @@ hooks:
 func TestE2E_OnlyOnce(t *testing.T) {
 	dir := t.TempDir()
 	hookPath := filepath.Join(dir, ".mewcode", "hooks.yaml")
-	os.MkdirAll(filepath.Dir(hookPath), 0o755)
+	_ = os.MkdirAll(filepath.Dir(hookPath), 0o755)
 
 	yamlContent := `
 hooks:
@@ -130,7 +130,7 @@ hooks:
 func TestE2E_AsyncNotBlocking(t *testing.T) {
 	dir := t.TempDir()
 	hookPath := filepath.Join(dir, ".mewcode", "hooks.yaml")
-	os.MkdirAll(filepath.Dir(hookPath), 0o755)
+	_ = os.MkdirAll(filepath.Dir(hookPath), 0o755)
 
 	yamlContent := `
 hooks:
@@ -169,7 +169,7 @@ hooks:
 func TestE2E_UserPromptSubmitBlock(t *testing.T) {
 	dir := t.TempDir()
 	hookPath := filepath.Join(dir, ".mewcode", "hooks.yaml")
-	os.MkdirAll(filepath.Dir(hookPath), 0o755)
+	_ = os.MkdirAll(filepath.Dir(hookPath), 0o755)
 
 	yamlContent := `
 hooks:
@@ -208,7 +208,7 @@ hooks:
 func TestE2E_AllOfAndAnyOfCondition(t *testing.T) {
 	dir := t.TempDir()
 	hookPath := filepath.Join(dir, ".mewcode", "hooks.yaml")
-	os.MkdirAll(filepath.Dir(hookPath), 0o755)
+	_ = os.MkdirAll(filepath.Dir(hookPath), 0o755)
 
 	yamlContent := `
 hooks:
@@ -261,7 +261,7 @@ hooks:
 func TestE2E_HooksCommand(t *testing.T) {
 	dir := t.TempDir()
 	hookPath := filepath.Join(dir, ".mewcode", "hooks.yaml")
-	os.MkdirAll(filepath.Dir(hookPath), 0o755)
+	_ = os.MkdirAll(filepath.Dir(hookPath), 0o755)
 
 	yamlContent := `
 hooks:

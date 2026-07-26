@@ -41,17 +41,6 @@ func (m *Model) dispatchSessionEnd() {
 	m.hookEngine.Dispatch(context.Background(), hook.EventSessionEnd, m.baseHookPayload(hook.EventSessionEnd))
 }
 
-// dispatchSessionResume 派发 SessionResume 事件并注入 reminders。
-func (m *Model) dispatchSessionResume() {
-	if m.hookEngine == nil {
-		return
-	}
-	result := m.hookEngine.Dispatch(context.Background(), hook.EventSessionResume, m.baseHookPayload(hook.EventSessionResume))
-	if m.runtime != nil && len(result.InjectedPrompts) > 0 {
-		m.runtime.AppendReminders(result.InjectedPrompts)
-	}
-}
-
 // ─── UserPromptSubmit ────────────────────────────────────
 
 // dispatchUserPromptSubmit 派发 UserPromptSubmit 事件。

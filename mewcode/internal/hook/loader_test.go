@@ -9,7 +9,7 @@ import (
 func TestLoaderValidYAML(t *testing.T) {
 	dir := t.TempDir()
 	hookPath := filepath.Join(dir, ".mewcode", "hooks.yaml")
-	os.MkdirAll(filepath.Dir(hookPath), 0o755)
+	_ = os.MkdirAll(filepath.Dir(hookPath), 0o755)
 
 	yamlContent := `
 hooks:
@@ -45,7 +45,7 @@ hooks:
 func TestLoaderMissingFields(t *testing.T) {
 	dir := t.TempDir()
 	hookPath := filepath.Join(dir, ".mewcode", "hooks.yaml")
-	os.MkdirAll(filepath.Dir(hookPath), 0o755)
+	_ = os.MkdirAll(filepath.Dir(hookPath), 0o755)
 
 	yamlContent := `
 hooks:
@@ -82,7 +82,7 @@ hooks:
 func TestLoaderAllOfAndAnyOf(t *testing.T) {
 	dir := t.TempDir()
 	hookPath := filepath.Join(dir, ".mewcode", "hooks.yaml")
-	os.MkdirAll(filepath.Dir(hookPath), 0o755)
+	_ = os.MkdirAll(filepath.Dir(hookPath), 0o755)
 
 	yamlContent := `
 hooks:
@@ -118,7 +118,7 @@ hooks:
 func TestLoaderAsyncBlockingConflict(t *testing.T) {
 	dir := t.TempDir()
 	hookPath := filepath.Join(dir, ".mewcode", "hooks.yaml")
-	os.MkdirAll(filepath.Dir(hookPath), 0o755)
+	_ = os.MkdirAll(filepath.Dir(hookPath), 0o755)
 
 	yamlContent := `
 hooks:
@@ -151,7 +151,7 @@ hooks:
 func TestLoaderInvalidRegex(t *testing.T) {
 	dir := t.TempDir()
 	hookPath := filepath.Join(dir, ".mewcode", "hooks.yaml")
-	os.MkdirAll(filepath.Dir(hookPath), 0o755)
+	_ = os.MkdirAll(filepath.Dir(hookPath), 0o755)
 
 	yamlContent := `
 hooks:

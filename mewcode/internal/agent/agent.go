@@ -546,7 +546,7 @@ func (a *Agent) executeBatched(ctx context.Context, calls []llm.ToolCall, mode p
 			for k := i; k < j; k++ {
 				// Hook: PreToolUse（权限 Check 之前）
 				toolInput := make(map[string]any)
-				json.Unmarshal(calls[k].Input, &toolInput)
+				_ = json.Unmarshal(calls[k].Input, &toolInput)
 				hr := a.dispatchHook(ctx, hook.EventPreToolUse, hook.Payload{
 					"event":      "PreToolUse",
 					"tool_name":  calls[k].Name,
@@ -644,7 +644,7 @@ func (a *Agent) executeBatched(ctx context.Context, calls []llm.ToolCall, mode p
 
 				// Hook: PostToolUse
 				toolInput := make(map[string]any)
-				json.Unmarshal(calls[k].Input, &toolInput)
+				_ = json.Unmarshal(calls[k].Input, &toolInput)
 				a.dispatchHook(ctx, hook.EventPostToolUse, hook.Payload{
 					"event":       "PostToolUse",
 					"tool_name":   calls[k].Name,
@@ -661,7 +661,7 @@ func (a *Agent) executeBatched(ctx context.Context, calls []llm.ToolCall, mode p
 
 			// Hook: PreToolUse（权限 Check 之前）
 			toolInput := make(map[string]any)
-			json.Unmarshal(call.Input, &toolInput)
+			_ = json.Unmarshal(call.Input, &toolInput)
 			hr := a.dispatchHook(ctx, hook.EventPreToolUse, hook.Payload{
 				"event":      "PreToolUse",
 				"tool_name":  call.Name,
