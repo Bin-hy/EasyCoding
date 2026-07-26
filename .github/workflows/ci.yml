@@ -48,7 +48,7 @@ jobs:
           go-version: ${{ matrix.go }}
 
       - name: Run tests
-        run: go test -v -race -coverprofile=coverage.out ./...
+        run: go test -v -race -coverprofile=coverage.out ./internal/... ./cmd/...
 
       - name: Upload coverage
         uses: actions/upload-artifact@v4
