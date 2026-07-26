@@ -116,6 +116,9 @@ func (t *globTool) Execute(ctx context.Context, args json.RawMessage) Result {
 // matchGlob 自实现支持 ** 的 glob 匹配。
 // ** 匹配任意层级目录（含零层）；普通通配沿用 path.Match。
 func matchGlob(pattern, path string) bool {
+	// 规范化路径分隔符为 /（Windows 兼容）
+	pattern = filepath.ToSlash(pattern)
+	path = filepath.ToSlash(path)
 	// 将 pattern 和 path 按 / 分段
 	patParts := strings.Split(pattern, "/")
 	pathParts := strings.Split(path, "/")

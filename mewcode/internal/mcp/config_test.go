@@ -283,6 +283,7 @@ mcp_servers:
 `)
 
 	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir) // Windows 兼容
 
 	dir := t.TempDir()
 	cfg, err := LoadConfig(dir)
@@ -327,6 +328,7 @@ mcp_servers:
     command: user-only-cmd
 `)
 	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir) // Windows 兼容
 
 	// 项目级: shared 用 project-url, 加 project-only
 	dir := t.TempDir()
