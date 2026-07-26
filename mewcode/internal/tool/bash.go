@@ -125,7 +125,10 @@ func (t *bashTool) Execute(ctx context.Context, args json.RawMessage) Result {
 			exitCode = exitErr.ExitCode()
 		}
 		if output == "" {
-			return errorResult("exit_code: %d\n命令执行失败: %v", exitCode, err)
+			return Result{
+				Content: fmt.Sprintf("exit_code: %d\n命令执行失败: %v", exitCode, err),
+				IsError: false,
+			}
 		}
 		return Result{
 			Content: fmt.Sprintf("exit_code: %d\n%s", exitCode, output),
